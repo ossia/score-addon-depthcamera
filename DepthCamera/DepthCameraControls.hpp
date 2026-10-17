@@ -42,7 +42,7 @@
 
 #include <QObject>
 
-#include <depthcam_abi.h>
+#include <DepthCamera/Backend/depthcam_abi.h>
 
 #include <atomic>
 #include <condition_variable>

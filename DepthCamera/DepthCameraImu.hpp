@@ -19,7 +19,7 @@
 #include <ossia/network/base/node.hpp>
 #include <ossia/network/base/parameter.hpp>
 
-#include <depthcam_abi.h>
+#include <DepthCamera/Backend/depthcam_abi.h>
 
 #include <memory>
 

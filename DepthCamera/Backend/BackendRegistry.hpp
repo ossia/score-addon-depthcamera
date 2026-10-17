@@ -1,6 +1,6 @@
 #pragma once
 
-#include <depthcam_abi.h>
+#include <DepthCamera/Backend/depthcam_abi.h>
 
 #include <QString>
 

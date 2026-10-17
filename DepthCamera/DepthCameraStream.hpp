@@ -2,7 +2,7 @@
 
 #include <Video/CameraInput.hpp>
 
-#include <depthcam_abi.h>
+#include <DepthCamera/Backend/depthcam_abi.h>
 
 #include <QString>
 
