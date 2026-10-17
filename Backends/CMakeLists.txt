@@ -861,6 +861,9 @@ elseif(SCORE_DEPTHCAM_BUILD_DEPTHAI
   if(_dai_arch)
     list(APPEND _dai_cmake_args "-DCMAKE_OSX_ARCHITECTURES=${_dai_arch}")
   endif()
+  if(MSVC)
+    list(APPEND _dai_cmake_args "-DCMAKE_CXX_FLAGS_INIT=/D_USE_MATH_DEFINES")
+  endif()
 
   ExternalProject_Add(depthai_core_ext
     SOURCE_DIR "${SCORE_DEPTHCAM_SDK_DIR}/depthai-core"
