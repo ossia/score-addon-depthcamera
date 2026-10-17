@@ -1,7 +1,6 @@
 #include "DepthCameraProtocol.hpp"
 
 #include <Crousti/Executor.hpp>
-#include <Threedim/TinyObj.hpp>
 
 #include <halp/controls.hpp>
 #include <halp/geometry.hpp>

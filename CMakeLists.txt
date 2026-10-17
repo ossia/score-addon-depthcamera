@@ -368,7 +368,6 @@ target_link_libraries(score_addon_orbbec PUBLIC
     score_plugin_media
     score_plugin_gfx
     score_plugin_avnd
-    score_plugin_threedim
 )
 
 set_target_properties(score_addon_orbbec PROPERTIES SCORE_CUSTOM_PCH 1)
