@@ -352,6 +352,10 @@ add_library(score_addon_orbbec
 target_include_directories(score_addon_orbbec
   PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/DepthCamera/Backend")
 
+if(FFMPEG_INCLUDE_DIRS)
+  target_include_directories(score_addon_orbbec SYSTEM PRIVATE ${FFMPEG_INCLUDE_DIRS})
+endif()
+
 # Only when there is a build tree to point at. Without it BackendRegistry looks
 # in the installed package directory and beside the plug-in binary, which is
 # exactly right for a plug-in built without backends.
