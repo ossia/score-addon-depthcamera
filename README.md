@@ -302,15 +302,88 @@ The device exposes one child node per enabled stream:
 | Node | Type | Notes |
 |---|---|---|
 | `rgb` | texture | the Oak CDK/QCDK have no colour sensor and do not offer it |
-| `ir` | texture | not offered by Kinect v1, which can stream IR only *instead of* colour; on a ToF camera this is the amplitude image |
-| `depth` | texture | 16-bit; the shader rescales using the unit the camera reports |
-| `pointcloud` | geometry | connect to *Model Display* or any geometry input |
+| `ir` | texture | R32F, the sensor's 8- or 16-bit range mapped to 0–1 and scaled by `controls/render/ir_gain`. Not offered by Kinect v1, which can stream IR only *instead of* colour; on a ToF camera this is the amplitude image |
+| `depth` | texture | R32F, metres along +Z, 0 where the sensor has no measurement. Or, with *Depth output: Preview*, the 0–4.5 m grey of earlier documents |
+| `positions` | texture | RGBA32F: xyz in metres in the depth camera's frame, w = 1 where valid. One texel per depth pixel. Opt-in |
+| `normals` | texture | RGBA16F, unit normals facing the camera, w = 1 where valid. Opt-in |
+| `mesh` | geometry | the depth grid as GPU vertex and index buffers: `position`, `normal`, `texcoord0` into the colour image. Triangles across a depth edge or with an invalid corner are dropped. Opt-in |
+| `pointcloud` | geometry | the SDK's CPU point cloud; connect to *Model Display* or any geometry input |
 | `imu/accel` | vec3f | acceleration in m/s², including gravity; off by default |
 | `imu/gyro` | vec3f | angular velocity in rad/s |
 | `imu/temperature` | float | degrees Celsius, where the camera reports it |
 
-Point-cloud positions are in **metres**, right-handed, +X right / +Y down /
-+Z forward. Colours, where present, are normalised to 0–1.
+Point-cloud and position coordinates are in **metres**, right-handed, +X right /
++Y down / +Z forward from the depth camera. Colours, where present, are
+normalised to 0–1.
+
+A stream nothing is connected to costs nothing: its frames go straight back to
+the SDK, and the backend is told not to produce it — which matters most for the
+CPU point cloud, the most expensive thing a camera does here.
+
+### Metric depth and the GPU outputs
+
+`depth`, `positions`, `normals` and `mesh` are four outlets of one node: each
+depth frame is uploaded once, as the 16-bit or float samples the camera sent,
+and turned into positions in one pass on the GPU, whichever outlets are
+connected. The depth unit comes with every frame, so a camera in 0.1 mm mode, a
+Kinect v2's float millimetres and an Oak's float metres all come out in metres.
+
+A float texture keeps its precision only into a float input: a shader input
+whose texture format is RGBA8 clamps metres to 1. Set the input's format to
+R32F (or RGBA32F for positions), or declare the input `STATIC`, which samples
+the device's own texture.
+
+The mesh needs compute shaders, which every backend has except OpenGL below 4.3 and OpenGL ES below 3.1;
+the textures do not.
+
+Host-side processing applies to all four, on every camera, whatever its SDK
+offers:
+
+| Control | |
+|---|---|
+| `controls/render/near`, `far` | depth outside these, in metres, is invalid; 0 for no limit |
+| `controls/render/stage_box/enabled`, `min`, `max` | only what lies inside the box, in the depth camera's frame, is kept |
+| `controls/render/temporal` | weight of the previous frames in a running average, 0 for none; a change of more than 5 % restarts it |
+| `controls/render/edge_cull` | a mesh triangle whose longest edge is more than this times its depth is dropped; 0 keeps every triangle with three valid corners |
+| `controls/render/topology` | `triangles` or `points` for the mesh |
+| `controls/render/ir_gain` | infrared brightness |
+
+For depth from anything else — the Kinect v2 device, a capture card, a
+monocular depth model — `Presets/Compute Shader/Depth to positions.cs` makes the
+same position map from a depth image and its intrinsics.
+
+### Calibration and metadata
+
+Read-only, alongside the streams:
+
+```
+cam:/info/{backend,model,serial,firmware,hardware_rev,transport,uri}
+cam:/info/depth_unit_mm            millimetres per raw depth sample, from the latest frame
+cam:/info/depth_range              vec2f, metres
+cam:/info/calibration_estimated    true when the camera reports nothing and a 60° pinhole stands in
+cam:/calibration/<s>/{width,height}             s = depth, color, ir
+cam:/calibration/<s>/intrinsics                 vec4f fx, fy, cx, cy
+cam:/calibration/<s>/distortion/{model,coeffs}  coeffs: k1 k2 k3 k4 k5 k6 p1 p2
+cam:/calibration/<s>/projection                 16 floats, column-major
+cam:/calibration/depth_to_color                 16 floats, column-major, metres
+cam:/calibration/depth_to_color/row0 ... row3   the same matrix, as vec4 rows
+cam:/calibration/depth_to_imu
+cam:/stats/<s>/{frames,dropped,fps,device_time_ms,host_time_ms,interval_ms}
+```
+
+Conventions: intrinsics are those of the stream **as delivered** (with depth
+aligned to colour, the depth stream has the colour camera's), in its pixels,
+with the centre of pixel (u, v) at (u, v) as in OpenCV. Matrices are
+column-major, metres. `projection` maps that camera's frame to OpenGL clip
+space for the near and far planes of `render/near` and `render/far` (the depth
+range when they are 0). The rows exist because ISF shaders take vectors but no
+matrices. The calibration is read again after anything that restarts the
+stream.
+
+`stats/<s>/device_time_ms` is updated at every frame, from the camera's clock,
+so a process can trigger on arrival; the rest ten times a second. Each frame
+also carries its capture time on the device clock and its arrival on the host
+clock through the graph.
 
 ### Orbbec cameras over Ethernet
 
@@ -441,26 +514,47 @@ ask the device what it supports. Roughly what to expect:
 
 | Camera | Controls |
 |---|---|
-| Orbbec Femto Mega | 39 — colour, depth, laser, IMU, fan, sync, sensors |
-| Intel RealSense D435i | 43 — per sensor: stereo module, RGB, IMU |
-| Azure Kinect DK | 12 — the colour controls, plus sensor temperature |
-| Kinect v2 | 5 — the three exposure modes and their parameters |
+| Orbbec Femto Mega | 39 — colour, depth, laser, IMU, fan, sync, sensors — plus its recommended filters, presets and depth work modes |
+| Intel RealSense D435i | 43 — per sensor: stereo module, RGB, IMU — plus the post-processing filters |
+| Azure Kinect DK | 12 — the colour controls, plus sensor temperature and the depth mode |
+| Kinect v2 | 5 — the three exposure modes and their parameters — plus the depth processing range and filters |
 | Kinect v1 | 6 — tilt, LED, accelerometer (see below) |
 
+Every control's description states its unit where the SDK states one, and its
+step; distances and times also carry an ossia unit. Tags mark what is
+`advanced`, what is an SDK `filter`, what is `volatile` (changes on its own)
+and what needs a `restart`.
 
-Two groups are worth calling out:
+A few groups are worth calling out:
 
-- **`sensors/`** holds read-only values: temperatures, accelerometers, the
-  exposure an automatic mode settled on. No SDK here reports a change, so these
-  are polled — but only while something is listening to them. A control nobody
-  is watching costs nothing.
+- **`filters/<name>/...`** are the SDK's own depth post-processing, where it has
+  any: the Orbbec recommended filter chain, librealsense's decimation,
+  threshold, spatial, temporal and hole filling, DepthAI's stereo settings,
+  libfreenect2's depth range and filters. They apply to the depth the device
+  delivers, and to the SDK point cloud.
+- **`device/preset`** and **`depth/mode`** are named lists: an Orbbec preset or
+  work mode, a RealSense visual preset, the k4a depth modes.
+- **`sensors/`** holds read-only values: temperatures, accelerometers. Most SDKs
+  do not report a change, so these — and a control its `auto` toggle has made
+  read-only, such as an exposure under auto-exposure — are polled, but only
+  while something is listening to them. librealsense does report changes,
+  and its controls are read again when it does. A control nobody is watching
+  costs nothing.
 - **`advanced/`** holds triggers with no readable value: rebooting the camera,
-  entering recovery mode. They are grouped away deliberately so they are not one
-  click from a performer mid-performance.
+  entering recovery mode, and the two below. They are grouped away deliberately
+  so they are not one click from a performer mid-performance.
 
-Writes go straight to the camera. A camera that clamps or rounds a value, or
-refuses it outright (an exposure while auto-exposure is on, a fan speed the
-firmware rejects), is reflected on the next read rather than silently accepted.
+Writes go to the camera from a thread of their own. A camera that clamps or
+rounds a value, or refuses it outright, is reflected on the next read rather
+than silently accepted. While an `auto` toggle is on, the controls it rules are
+read-only. A control that only takes effect when the stream restarts (a depth
+mode) restarts it, and the calibration is read again.
+
+**What you write is saved with the document**, in the order you wrote it, and
+written back to the camera the next time it opens, before it starts streaming.
+`advanced/store_current_settings` saves every current setting instead,
+including ones changed in another program; `advanced/reset_to_defaults` puts
+every setting back to the camera's default and forgets the saved ones.
 
 **Kinect v1 tilt and LED** are opt-in: append `?motor=1` to the address. The
 motor is a separate USB interface, and on the original model 1414 claiming it
@@ -493,7 +587,9 @@ least one of them walks off the end of the colour image.
 
 ### Resolution and frame rate
 
-`Any` lets the backend choose. Two things worth knowing:
+`Any` lets the backend choose. Where the backend can list them, each stream
+also offers the modes the camera has, and picking one fills in the three
+values. Two things worth knowing:
 
 - Setting a **colour resolution** is the simplest way to cut the cost of a
   *depth to color* point cloud.
@@ -782,11 +878,24 @@ matters: one shared object, one exported symbol, reached only through
 Writing a backend for another camera means implementing one header. Nothing on
 the score side is camera-specific.
 
+The ABI only grows. score accepts backends from ABI 3 (the version-1 package)
+to its own, ABI 4 (the version-2 package): it copies a backend's table into one
+of its own layout and leaves what an older backend lacks empty, so an ABI 3
+package still streams, with an estimated calibration and its controls as they
+were. A package newer than score is refused.
+
 ## Testing
 
-`Tests/` holds two suites: harnesses that drive a backend `.so` directly through
-the ABI, and scripts that drive score itself through its JS API. Both need real
-hardware; see [Tests/README.md](Tests/README.md).
+`Tests/unit`, `Tests/gfx` and `Tests/perf` need no camera: they run against
+`Backends/Synthetic`, a backend whose scene, calibration and timestamps are
+known in closed form, built with score's tests (`SCORE_TESTING`) and never
+packaged. They cover the units and sample types, timestamps, calibration, the
+metadata tree, the controls and their persistence, settings from older
+documents, ABI 3 backends, and the GPU outputs on every graphics backend
+present. `depthcam_perf` reports what a frame costs, CPU path against GPU path.
+
+`Tests/abi` and `Tests/score` drive a real camera, through the ABI directly or
+through score's JS API; see [Tests/README.md](Tests/README.md).
 
 Notes on the vendored OrbbecSDK and what upgrading it would involve are in
 [Documentation/orbbec-sdk-upgrade.md](Documentation/orbbec-sdk-upgrade.md).
