@@ -903,6 +903,20 @@ elseif(SCORE_DEPTHCAM_BUILD_DEPTHAI
   endif()
   if(MSVC)
     list(APPEND _dai_cmake_args "-DCMAKE_CXX_FLAGS_INIT=/D_USE_MATH_DEFINES")
+
+    # Our own Windows triplets (DepthAI/triplets): every dependency static
+    # against the dynamic CRT, libusb excepted. Without them arm64 gets vcpkg's
+    # stock arm64-windows -- all DLLs, which the backend then imports and the
+    # package does not ship. MSVC_CXX_ARCHITECTURE_ID is the target, not the
+    # host: ARM64, x64.
+    if(MSVC_CXX_ARCHITECTURE_ID MATCHES "^ARM64")
+      set(_dai_triplet "score-arm64-windows")
+    else()
+      set(_dai_triplet "score-x64-windows")
+    endif()
+    list(APPEND _dai_cmake_args
+      "-DVCPKG_TARGET_TRIPLET=${_dai_triplet}"
+      "-DVCPKG_OVERLAY_TRIPLETS=${CMAKE_CURRENT_LIST_DIR}/DepthAI/triplets")
   endif()
 
   ExternalProject_Add(depthai_core_ext

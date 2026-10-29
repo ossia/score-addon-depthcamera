@@ -143,7 +143,9 @@ same plumbing the Oak backend next door already uses:
   dynamic`, so everything vcpkg builds for it, and depthai-core itself, is
   compiled `/MD`. This backend, which links them in, is therefore built `/MD`
   too, unlike the rest of the package, and needs the Visual C++
-  redistributable.
+  redistributable. The triplets are ours (`triplets/score-{x64,arm64}-windows`):
+  depthai ships none for arm64 Windows, and vcpkg's stock one builds every
+  dependency as a DLL that the backend would import and the package not ship.
 - **a delay-load.** `libusb-1.0.dll` sits beside the backend, where Windows
   does not look for a module's imports. `/DELAYLOAD:libusb-1.0.dll` lets
   `init()` load it by full path with `LOAD_WITH_ALTERED_SEARCH_PATH` first.
