@@ -320,6 +320,12 @@ add_library(score_addon_orbbec
   DepthCamera/DepthCameraControls.cpp
   DepthCamera/DepthCameraImu.hpp
   DepthCamera/DepthCameraImu.cpp
+  DepthCamera/DepthCameraCalibration.hpp
+  DepthCamera/DepthCameraCalibration.cpp
+  DepthCamera/DepthCameraInfo.hpp
+  DepthCamera/DepthCameraInfo.cpp
+  DepthCamera/DepthCameraGpu.hpp
+  DepthCamera/DepthCameraGpu.cpp
 
   score_addon_orbbec.hpp
   score_addon_orbbec.cpp
@@ -354,3 +360,10 @@ set_target_properties(score_addon_orbbec PROPERTIES SCORE_CUSTOM_PCH 1)
 
 # Target-specific options
 setup_score_plugin(score_addon_orbbec)
+
+### Tests: the synthetic camera, linked in or loaded as a backend, and score's
+### own test fixtures. Nothing here needs a camera or an SDK.
+if(SCORE_TESTING AND COMMAND score_add_test)
+  include("${CMAKE_CURRENT_SOURCE_DIR}/Backends/Synthetic/Synthetic.cmake")
+  add_subdirectory(Tests)
+endif()

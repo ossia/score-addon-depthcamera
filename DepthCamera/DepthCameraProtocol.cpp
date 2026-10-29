@@ -267,10 +267,32 @@ struct DeviceNode final
 {
   std::shared_ptr<Gfx::DepthCamera::InputStreamExtractor> dec;
 
+  /// Told when the node starts and stops being drawn, so the camera can stop
+  /// computing a point cloud nobody reads.
+  std::function<void(bool)> consuming;
+  bool m_consuming{};
+
   explicit DeviceNode(std::shared_ptr<Gfx::DepthCamera::InputStreamExtractor> d)
       : dec{std::move(d)}
   {
     initGfxPorts<Node_T>(this, this->input, this->output);
+  }
+
+  ~DeviceNode()
+  {
+    if(m_consuming && consuming)
+      consuming(false);
+  }
+
+  void renderedNodesChanged() override
+  {
+    const bool now = !this->renderedNodes.empty();
+    if(now != m_consuming)
+    {
+      m_consuming = now;
+      if(consuming)
+        consuming(now);
+    }
   }
 
   score::gfx::NodeRenderer*
@@ -284,64 +306,100 @@ struct DeviceNode final
 namespace Gfx::DepthCamera
 {
 
-depthcam_parameter::depthcam_parameter(
-    const std::shared_ptr<InputStreamExtractor>& dec, ossia::net::node_base& n,
-    GfxExecutionAction& ctx)
-    : ossia::gfx::texture_parameter{n}
-    , context{&ctx}
-    , decoder{dec}
-    , node{new score::gfx::CameraNode{dec, dec->filter}}
+namespace
 {
-  node_id = context->ui->register_node(std::unique_ptr<score::gfx::Node>(node));
+/// The colour stream, through score's own video path, which reports when it
+/// starts and stops being drawn.
+class ColorNode final : public score::gfx::CameraNode
+{
+public:
+  ColorNode(
+      std::shared_ptr<InputStream> s, std::shared_ptr<InputStreamExtractor> dec)
+      : score::gfx::CameraNode{dec, {}}
+      , m_stream{std::move(s)}
+  {
+  }
+  ~ColorNode() override
+  {
+    if(m_consuming && m_stream)
+      m_stream->addConsumer(m_stream->m_rgb, -1);
+  }
+
+  void renderedNodesChanged() override
+  {
+    score::gfx::CameraNode::renderedNodesChanged();
+    const bool now = !renderedNodes.empty();
+    if(now != m_consuming && m_stream)
+    {
+      m_consuming = now;
+      m_stream->addConsumer(m_stream->m_rgb, now ? 1 : -1);
+    }
+  }
+
+private:
+  std::shared_ptr<InputStream> m_stream;
+  bool m_consuming{};
+};
 }
 
-depthcam_parameter::~depthcam_parameter()
+registered_node::registered_node(
+    GfxExecutionAction& ctx, std::unique_ptr<score::gfx::Node> n)
+    : context{&ctx}
+    , node{n.get()}
 {
-  context->ui->unregister_node(node_id);
+  id = context->ui->register_node(std::move(n));
 }
+
+registered_node::~registered_node()
+{
+  context->ui->unregister_node(id);
+}
+
+depthcam_parameter::depthcam_parameter(
+    std::shared_ptr<registered_node> nd, int out, ossia::net::node_base& n)
+    : ossia::gfx::texture_parameter{n}
+    , node{std::move(nd)}
+    , outlet{out}
+{
+}
+
+depthcam_parameter::~depthcam_parameter() = default;
 
 void depthcam_parameter::pull_texture(port_index idx)
 {
-  context->setEdge(
-      port_index{this->node_id, 0}, idx, Process::CableType::ImmediateGlutton);
+  node->context->setEdge(
+      port_index{node->id, outlet}, idx, Process::CableType::ImmediateGlutton);
 
   score::gfx::Message m;
-  m.node_id = node_id;
-  context->ui->send_message(std::move(m));
+  m.node_id = node->id;
+  node->context->ui->send_message(std::move(m));
 }
 
-depthcam_pcl_parameter::depthcam_pcl_parameter(
-    const std::shared_ptr<InputStreamExtractor>& dec, ossia::net::node_base& n,
-    GfxExecutionAction& ctx)
+depthcam_geometry_parameter::depthcam_geometry_parameter(
+    std::shared_ptr<registered_node> nd, int out, ossia::net::node_base& n)
     : ossia::gfx::geometry_parameter{n}
-    , context{&ctx}
-    , decoder{dec}
+    , node{std::move(nd)}
+    , outlet{out}
 {
-  node = new oscr::DeviceNode<PointCloudMesh>{dec};
-  node_id = context->ui->register_node(std::unique_ptr<score::gfx::Node>(node));
 }
 
-depthcam_pcl_parameter::~depthcam_pcl_parameter()
-{
-  context->ui->unregister_node(node_id);
-}
+depthcam_geometry_parameter::~depthcam_geometry_parameter() = default;
 
-void depthcam_pcl_parameter::pull_geometry(port_index idx)
+void depthcam_geometry_parameter::pull_geometry(port_index idx)
 {
-  context->setEdge(
-      port_index{this->node_id, 0}, idx, Process::CableType::ImmediateGlutton);
+  node->context->setEdge(
+      port_index{node->id, outlet}, idx, Process::CableType::ImmediateGlutton);
 
   score::gfx::Message m;
-  m.node_id = node_id;
-  context->ui->send_message(std::move(m));
+  m.node_id = node->id;
+  node->context->ui->send_message(std::move(m));
 }
 
 depthcam_node::depthcam_node(
-    const std::shared_ptr<InputStreamExtractor>& dec, Kind kind,
-    GfxExecutionAction& ctx, ossia::net::device_base& dev, std::string name)
+    ossia::net::device_base& dev, std::string name, const parameter_factory& make)
     : m_device{dev}
 {
-  // Name first: the parameters below capture *this, and the address has to be
+  // Name first: the parameter below captures *this, and the address has to be
   // valid by then.
   m_name = std::move(name);
 
@@ -352,15 +410,7 @@ depthcam_node::depthcam_node(
   // name: OSC exposure, remote control, Score.iterateDevice in a script.
   m_oscAddressCache = ossia::net::osc_parameter_string(*this);
 
-  switch(kind)
-  {
-    case Kind::PointCloud:
-      m_parameter = std::make_unique<depthcam_pcl_parameter>(dec, *this, ctx);
-      break;
-    case Kind::Texture:
-      m_parameter = std::make_unique<depthcam_parameter>(dec, *this, ctx);
-      break;
-  }
+  m_parameter = make(*this);
 }
 
 depthcam_protocol::depthcam_protocol(
@@ -449,53 +499,82 @@ void depthcam_protocol::stop_execution()
 
 depthcam_device_impl::depthcam_device_impl(
     const DepthCameraSettings& settings, GfxExecutionAction& ctx,
-    std::unique_ptr<depthcam_protocol> proto, std::string name)
+    std::unique_ptr<depthcam_protocol> proto, std::string name,
+    ControlTree::StoreCallback onStore)
     : ossia::net::generic_device{std::move(proto), std::move(name)}
+    , m_params{std::make_shared<RenderParams>()}
+    , m_calib{std::make_shared<Calibration>()}
 {
   auto& protocol = static_cast<depthcam_protocol&>(*m_protocol);
   auto& stream = protocol.stream;
 
-  const auto addTexture
-      = [&](StreamOutput& out, const char* child_name, QString filter) {
-    auto dec = std::make_shared<InputStreamExtractor>(stream, out, std::move(filter));
+  const auto extractor = [&](StreamOutput& out) {
+    auto dec = std::make_shared<InputStreamExtractor>(stream, out, QString{});
     protocol.registerExtractor(dec);
+    return dec;
+  };
+  const auto texture = [&](const std::shared_ptr<registered_node>& node, int outlet,
+                           const char* child_name) {
     this->add_child(std::make_unique<depthcam_node>(
-        dec, depthcam_node::Kind::Texture, ctx, *this, child_name));
+        *this, child_name, [&](ossia::net::node_base& n) {
+      return std::make_unique<depthcam_parameter>(node, outlet, n);
+    }));
   };
 
   if(settings.rgb)
-    addTexture(stream->m_rgb, "rgb", {});
+  {
+    auto dec = extractor(stream->m_rgb);
+    auto node = std::make_shared<registered_node>(
+        ctx, std::make_unique<ColorNode>(stream, dec));
+    texture(node, 0, "rgb");
+  }
 
   if(settings.ir)
   {
-    // IR arrives as 8- or 16-bit grey; without a filter it renders as a red
-    // channel only, and the 16-bit range is far darker than it should be.
-    addTexture(
-        stream->m_ir, "ir",
-        "float v = tex.r; processed.rgb = vec3(v, v, v); processed.a = 1.;");
+    auto dec = extractor(stream->m_ir);
+    auto node = std::make_shared<registered_node>(
+        ctx, std::make_unique<DepthStreamNode>(
+                 DepthStreamNode::Kind::Infrared, stream, stream->m_ir, dec, m_params,
+                 m_calib, settings.depthOutput));
+    texture(node, 0, "ir");
   }
 
-  if(settings.depth)
+  // One node for every output computed from depth: the frame is uploaded and
+  // turned into positions once, whichever of them are read.
+  if(settings.depth || settings.positions || settings.normals || settings.mesh)
   {
-    // Depth arrives as millimetres in a 16-bit container, which the sampler
-    // normalises to 0-1. Rescale to a usable 0-4.5 m range using the unit the
-    // backend reported, falling back to 1mm/unit if it did not.
-    const float unit = stream->depth_unit_mm.load() > 0.f
-                           ? stream->depth_unit_mm.load()
-                           : 1.f;
-    addTexture(
-        stream->m_depth, "depth",
-        QStringLiteral("float v = tex.r * 65535. * %1 / 4500.; processed.rgb = "
-                       "vec3(v, v, v); processed.a = 1.;")
-            .arg(double(unit)));
+    auto dec = extractor(stream->m_depth);
+    auto node = std::make_shared<registered_node>(
+        ctx, std::make_unique<DepthStreamNode>(
+                 DepthStreamNode::Kind::Depth, stream, stream->m_depth, dec, m_params,
+                 m_calib, settings.depthOutput));
+    if(settings.depth)
+      texture(node, DepthStreamNode::DepthOut, "depth");
+    if(settings.positions)
+      texture(node, DepthStreamNode::PositionsOut, "positions");
+    if(settings.normals)
+      texture(node, DepthStreamNode::NormalsOut, "normals");
+    if(settings.mesh)
+      this->add_child(std::make_unique<depthcam_node>(
+          *this, "mesh", [&](ossia::net::node_base& n) {
+        return std::make_unique<depthcam_geometry_parameter>(
+            node, DepthStreamNode::MeshOut, n);
+      }));
   }
 
   if(settings.pointcloud)
   {
-    auto dec = std::make_shared<InputStreamExtractor>(stream, stream->m_pcl, QString{});
-    protocol.registerExtractor(dec);
+    auto dec = extractor(stream->m_pcl);
+    auto pcl = std::make_unique<oscr::DeviceNode<PointCloudMesh>>(dec);
+    pcl->consuming = [s = std::weak_ptr<InputStream>{stream}](bool on) {
+      if(auto st = s.lock())
+        st->addConsumer(st->m_pcl, on ? 1 : -1);
+    };
+    auto node = std::make_shared<registered_node>(ctx, std::move(pcl));
     this->add_child(std::make_unique<depthcam_node>(
-        dec, depthcam_node::Kind::PointCloud, ctx, *this, "pointcloud"));
+        *this, "pointcloud", [&](ossia::net::node_base& n) {
+      return std::make_unique<depthcam_geometry_parameter>(node, 0, n);
+    }));
   }
 
   // Only if the camera really has one: a Kinect v2 does not, and three nodes
@@ -503,13 +582,27 @@ depthcam_device_impl::depthcam_device_impl(
   if(settings.imu && (stream->activeStreams() & DEPTHCAM_STREAM_IMU))
     m_imu = std::make_unique<ImuTree>(stream, *this, *this);
 
+  // Calibration and identity: what the GPU outputs are computed with, and what
+  // a shader binds to reproject them.
+  if(auto* backend = stream->backend(); backend && stream->device())
+  {
+    m_calib->setRaySource(backend, stream->device());
+    QString backendName = QString::fromUtf8(backend->name ? backend->name : "");
+    m_info = std::make_unique<InfoTree>(
+        stream, m_calib, *this, settings.device, backendName, QString{});
+  }
+
   // Last, so the streams stay at the top of the explorer: a camera can publish
   // fifty settings and the four things a user is looking for should not be at
   // the bottom of that list.
   if(auto* backend = stream->backend(); backend && stream->device())
   {
     auto tree = std::make_unique<ControlTree>(
-        *backend, *stream->device(), *this, *this);
+        *backend, *stream->device(), stream, *this, *this, m_params, settings.controls,
+        std::move(onStore), [this] {
+      if(m_info)
+        m_info->refresh();
+    });
     if(!tree->empty())
     {
       protocol.setControls(tree.get());
@@ -523,6 +616,11 @@ void depthcam_device_impl::releaseControls() noexcept
   // The protocol must stop routing writes here before the tree goes.
   static_cast<depthcam_protocol&>(*m_protocol).setControls(nullptr);
   m_controls.reset();
+
+  // Stops the camera thread's stats callback, and the renderers' ray lookups.
+  m_info.reset();
+  if(m_calib)
+    m_calib->setRaySource(nullptr, nullptr);
 
   // And the camera must stop pushing samples at parameters that are about to
   // be freed. ~ImuTree does not return until any callback in flight has.
