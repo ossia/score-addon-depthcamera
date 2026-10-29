@@ -53,6 +53,11 @@ foreach(_abi IN ITEMS current 3)
   if(NOT _abi STREQUAL "current")
     target_compile_definitions(${_tgt} PRIVATE SYNTHETIC_ABI_VERSION=${_abi})
   endif()
+  # The registry looks for score_depthcam_*.dylib on macOS, where a MODULE
+  # otherwise ends in .so.
+  if(APPLE)
+    set_target_properties(${_tgt} PROPERTIES SUFFIX ".dylib")
+  endif()
   set_target_properties(${_tgt} PROPERTIES
     PREFIX ""
     LIBRARY_OUTPUT_DIRECTORY "${SCORE_DEPTHCAM_TEST_BACKEND_DIR}"
