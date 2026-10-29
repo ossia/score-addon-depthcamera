@@ -70,6 +70,10 @@ const char* backend_last_error()
 std::unique_ptr<PointCloud::CameraSystem> g_system;
 std::recursive_mutex g_system_mutex;
 
+/// Every device open in this process, under g_system_mutex: list_profiles can
+/// only ask a connected camera, and connecting is what open() is for.
+std::vector<depthcam_device*> g_open_devices;
+
 void set_env(const char* name, const std::string& value)
 {
 #if defined(_WIN32)
@@ -179,29 +183,53 @@ struct CuratedControl
   const char* sdk_name;
   const char* id;
   const char* name;
+  /// Used only when the SDK's own Parameter carries no unit (or cannot be
+  /// reached; see describe_parameter).
+  const char* unit;
+  uint32_t flags;
 };
 
+/**
+ * Units, where they are known rather than guessed. The SDK's DML files spell
+ * none for these parameters (they are created by the camera plug-in, not the
+ * DML), so they come from the shipped profiles: OakCDKCameraNormal.conf pairs
+ * mod_freq1 = 100 and mod_freq2 = 80 with unambiguous_range = 7.45, which is
+ * c / (2 * 20 MHz), the dealiased range of 100 and 80 MHz -- so the
+ * frequencies are MHz and the ranges metres, and near_distance (0.3 there) is
+ * metres with them.
+ */
 const CuratedControl curated_controls[] = {
-    {"intg_time", "depth/integration_time", "integration time"},
-    {"intg_scale", "depth/integration_scale", "integration scale"},
-    {"unambiguous_range", "depth/unambiguous_range", "unambiguous range"},
-    {"near_distance", "depth/near_distance", "near distance"},
-    {"measure_mode", "depth/measure_mode", "measure mode"},
-    {"mod_freq1", "depth/modulation_frequency1", "modulation frequency 1"},
-    {"mod_freq2", "depth/modulation_frequency2", "modulation frequency 2"},
-    {"dealias_en", "depth/dealiasing", "dealiasing"},
-    {"hdr_en", "depth/hdr", "HDR"},
-    {"filter_en", "depth/filtering", "on-camera filtering"},
-    {"amp_threhold", "depth/amplitude_threshold", "amplitude threshold"},
-    {"binning_mode", "depth/binning_mode", "binning mode"},
+    {"intg_time", "depth/integration_time", "integration time", nullptr, 0},
+    {"intg_scale", "depth/integration_scale", "integration scale", nullptr,
+     DEPTHCAM_CONTROL_ADVANCED},
+    {"unambiguous_range", "depth/unambiguous_range", "unambiguous range", "m", 0},
+    {"near_distance", "depth/near_distance", "near distance", "m", 0},
+    {"measure_mode", "depth/measure_mode", "measure mode", nullptr,
+     DEPTHCAM_CONTROL_ADVANCED},
+    {"mod_freq1", "depth/modulation_frequency1", "modulation frequency 1", "MHz",
+     DEPTHCAM_CONTROL_ADVANCED},
+    {"mod_freq2", "depth/modulation_frequency2", "modulation frequency 2", "MHz",
+     DEPTHCAM_CONTROL_ADVANCED},
+    {"dealias_en", "depth/dealiasing", "dealiasing", nullptr,
+     DEPTHCAM_CONTROL_ADVANCED},
+    {"hdr_en", "depth/hdr", "HDR", nullptr, 0},
+    // The profiles describe it as "enable Bilateral Filter and EdgeAware
+    // Filter" (OakCDKCameraNormal.conf). The id predates the filters/ group and
+    // is kept so saved documents still find it.
+    {"filter_en", "depth/filtering", "on-camera filtering", nullptr,
+     DEPTHCAM_CONTROL_FILTER},
+    {"amp_threhold", "depth/amplitude_threshold", "amplitude threshold", nullptr, 0},
+    {"binning_mode", "depth/binning_mode", "binning mode", nullptr, 0},
     // Under depth/, not a group of their own: the ToF sensor is the only one
     // on these modules, so the flip is a property of the depth stream (and of
     // the IR and the cloud derived from it) the way an Orbbec's depth/mirror
     // is.
-    {"img_orientation_h", "depth/flip_horizontal", "flip horizontally"},
-    {"img_orientation_v", "depth/flip_vertical", "flip vertically"},
-    {"tsensor", "sensors/sensor_temperature", "sensor temperature"},
-    {"tillum", "sensors/illumination_temperature", "illumination temperature"},
+    {"img_orientation_h", "depth/flip_horizontal", "flip horizontally", nullptr, 0},
+    {"img_orientation_v", "depth/flip_vertical", "flip vertically", nullptr, 0},
+    {"tsensor", "sensors/sensor_temperature", "sensor temperature", nullptr,
+     DEPTHCAM_CONTROL_VOLATILE},
+    {"tillum", "sensors/illumination_temperature", "illumination temperature",
+     nullptr, DEPTHCAM_CONTROL_VOLATILE},
 };
 
 /// Not a Parameter: the SDK only exposes the rate through get/setFrameRate.
@@ -222,6 +250,9 @@ struct Control
 
   std::vector<std::string> labels;
   std::vector<const char*> label_ptrs;
+
+  std::string unit;
+  uint32_t flags{};
 
   /// Which DepthCamera::get<T>/set<T> reaches this parameter. The SDK compiled
   /// only these four instantiations.
@@ -330,6 +361,7 @@ bool describe_parameter(const PointCloud::ParameterPtr& p, Control& c)
     c.min = r->lowerLimit();
     c.max = r->upperLimit();
     c.step = 1;
+    c.unit = r->unit();
     return true;
   }
 
@@ -340,6 +372,7 @@ bool describe_parameter(const PointCloud::ParameterPtr& p, Control& c)
     c.min = r->lowerLimit();
     c.max = r->upperLimit();
     c.step = 1;
+    c.unit = r->unit();
     return true;
   }
 
@@ -350,6 +383,7 @@ bool describe_parameter(const PointCloud::ParameterPtr& p, Control& c)
     c.min = r->lowerLimit();
     c.max = r->upperLimit();
     c.step = 0;
+    c.unit = r->unit();
     return true;
   }
 
@@ -464,6 +498,14 @@ struct depthcam_device
   void* user{};
 
   int32_t width{}, height{};
+  /// The size of the last depth frame, which binning_mode can change while
+  /// streaming; 0 until one arrives.
+  std::atomic<uint32_t> frame_w{}, frame_h{};
+
+  /// Which opened streams the host consumes; see backend_set_stream_demand.
+  std::atomic<uint32_t> demand{~0u};
+
+  std::string chipset;
 
   std::vector<Control> controls;
 
@@ -482,6 +524,17 @@ struct depthcam_device
 
 depthcam_device::~depthcam_device()
 {
+  try
+  {
+    std::lock_guard<std::recursive_mutex> lock{g_system_mutex};
+    g_open_devices.erase(
+        std::remove(g_open_devices.begin(), g_open_devices.end(), this),
+        g_open_devices.end());
+  }
+  catch(...)
+  {
+  }
+
   if(!camera)
     return;
 
@@ -549,10 +602,14 @@ void depthcam_device::onDepthFrame(const PointCloud::Frame& frame)
   if(w <= 0 || h <= 0)
     return;
 
+  frame_w.store(uint32_t(w), std::memory_order_relaxed);
+  frame_h.store(uint32_t(h), std::memory_order_relaxed);
+
   // Frame::timestamp is documented as a Unix timestamp in microseconds.
   const uint64_t ts = uint64_t(d.timestamp) * 1000ull;
+  const uint32_t wanted = demand.load(std::memory_order_relaxed);
 
-  if((cfg.streams & DEPTHCAM_STREAM_DEPTH)
+  if((cfg.streams & DEPTHCAM_STREAM_DEPTH) && (wanted & DEPTHCAM_STREAM_DEPTH)
      && d.depth.size() == std::size_t(w) * h)
   {
     // 1000, not 1: DepthFrame::depth is in metres, and depth_unit_mm is what
@@ -563,7 +620,7 @@ void depthcam_device::onDepthFrame(const PointCloud::Frame& frame)
 
   // The ToF amplitude image is this camera's infrared, normalised to 0..1 by
   // the SDK. There is no separate IR sensor, so cfg.ir_* are ignored.
-  if((cfg.streams & DEPTHCAM_STREAM_IR)
+  if((cfg.streams & DEPTHCAM_STREAM_IR) && (wanted & DEPTHCAM_STREAM_IR)
      && d.amplitude.size() == std::size_t(w) * h)
   {
     emit(DEPTHCAM_STREAM_IR, DEPTHCAM_FMT_GRAYF32,
@@ -575,7 +632,8 @@ void depthcam_device::onPointCloudFrame(const PointCloud::Frame& frame)
 {
   if(!running.load(std::memory_order_acquire) || !on_frame)
     return;
-  if(!(cfg.streams & DEPTHCAM_STREAM_POINTCLOUD))
+  if(!(cfg.streams & DEPTHCAM_STREAM_POINTCLOUD)
+     || !(demand.load(std::memory_order_relaxed) & DEPTHCAM_STREAM_POINTCLOUD))
     return;
 
   // static_cast for the same reason as in onDepthFrame:
@@ -676,7 +734,8 @@ void depthcam_device::buildControls()
   }();
 
   const auto add = [&](const std::string& sdk_name, const std::string& id,
-                       const std::string& label) {
+                       const std::string& label, const char* unit,
+                       uint32_t flags) {
     const auto it = params.find(sdk_name);
     if(it == params.end() || !it->second)
       return;
@@ -697,6 +756,13 @@ void depthcam_device::buildControls()
     if(!sdk_desc.empty())
       c.description = sdk_desc + c.description;
 
+    if(c.unit.empty() && unit)
+      c.unit = unit;
+    c.flags = flags;
+    // A read-only register is a measurement: the temperatures, mostly.
+    if(c.access == DEPTHCAM_ACCESS_READ)
+      c.flags |= DEPTHCAM_CONTROL_VOLATILE;
+
     // After shrink_to_fit, which would otherwise move the strings the pointers
     // are taken from. Moving `c` into `controls` afterwards keeps them valid:
     // the labels vector's buffer moves as a whole.
@@ -715,13 +781,14 @@ void depthcam_device::buildControls()
       if(!p)
         continue;
       const auto& display = p->displayName();
-      add(sdk_name, "advanced/" + sdk_name, display.empty() ? sdk_name : display);
+      add(sdk_name, "advanced/" + sdk_name, display.empty() ? sdk_name : display,
+          nullptr, DEPTHCAM_CONTROL_ADVANCED);
     }
   }
   else
   {
     for(const auto& d : curated_controls)
-      add(d.sdk_name, d.id, d.name);
+      add(d.sdk_name, d.id, d.name, d.unit, d.flags);
   }
 
   // Parameter holds the real default but does not expose it, so the host is
@@ -1005,8 +1072,10 @@ depthcam_device* backend_open(const char* uri, const depthcam_open_config* confi
       dev->height = int32_t(actual.height);
     }
 
+    dev->chipset = dev->camera->chipset();
     dev->buildControls();
 
+    g_open_devices.push_back(dev.get());
     return dev.release();
   }
   catch(const std::exception& e)
@@ -1084,6 +1153,11 @@ int backend_start(depthcam_device* dev, depthcam_frame_cb on_frame, void* user)
           });
     }
 
+    // Registered whatever the stream demand: the cloud has to come back the
+    // moment the host wants it again, and nothing in DepthCamera.h says a
+    // callback may be (un)registered while the capture thread runs. So with
+    // the demand off, the SDK's transform still runs and only the conversion
+    // in onPointCloudFrame is skipped.
     if(want_cloud)
     {
       dev->camera->registerCallback(
@@ -1147,6 +1221,23 @@ void backend_stop(depthcam_device* dev)
   }
 }
 
+depthcam_control base_of(const Control& c)
+{
+  depthcam_control out{};
+  out.id = c.id.c_str();
+  out.name = c.name.c_str();
+  out.description = c.description.empty() ? nullptr : c.description.c_str();
+  out.kind = c.kind;
+  out.access = c.access;
+  out.min = c.min;
+  out.max = c.max;
+  out.step = c.step;
+  out.def = c.def;
+  out.enum_labels = c.label_ptrs.empty() ? nullptr : c.label_ptrs.data();
+  out.enum_count = int32_t(c.label_ptrs.size());
+  return out;
+}
+
 int backend_list_controls(depthcam_device* dev, depthcam_control_cb cb, void* user)
 {
   if(!dev || !cb)
@@ -1154,18 +1245,24 @@ int backend_list_controls(depthcam_device* dev, depthcam_control_cb cb, void* us
 
   for(const auto& c : dev->controls)
   {
-    depthcam_control out{};
-    out.id = c.id.c_str();
-    out.name = c.name.c_str();
-    out.description = c.description.empty() ? nullptr : c.description.c_str();
-    out.kind = c.kind;
-    out.access = c.access;
-    out.min = c.min;
-    out.max = c.max;
-    out.step = c.step;
-    out.def = c.def;
-    out.enum_labels = c.label_ptrs.empty() ? nullptr : c.label_ptrs.data();
-    out.enum_count = int32_t(c.label_ptrs.size());
+    const depthcam_control out = base_of(c);
+    cb(&out, user);
+  }
+  return 1;
+}
+
+int backend_list_controls2(depthcam_device* dev, depthcam_control2_cb cb, void* user)
+{
+  if(!dev || !cb)
+    return 0;
+
+  for(const auto& c : dev->controls)
+  {
+    depthcam_control2 out{};
+    out.struct_size = sizeof(out);
+    out.base = base_of(c);
+    out.unit = c.unit.empty() ? nullptr : c.unit.c_str();
+    out.flags = c.flags;
     cb(&out, user);
   }
   return 1;
@@ -1300,6 +1397,230 @@ uint32_t backend_active_streams(depthcam_device* dev)
              | DEPTHCAM_STREAM_POINTCLOUD);
 }
 
+// --- ABI 4 -------------------------------------------------------------------
+
+/// A numeric parameter of whichever of the four types the SDK instantiates.
+bool read_number(const PointCloud::DepthCamera& cam, const char* name, double& out)
+{
+  if(float v{}; cam.get(name, v))
+  {
+    out = v;
+    return true;
+  }
+  if(uint v{}; cam.get(name, v))
+  {
+    out = v;
+    return true;
+  }
+  if(int v{}; cam.get(name, v))
+  {
+    out = v;
+    return true;
+  }
+  return false;
+}
+
+/**
+ * @brief The lens calibration the SDK deprojects with.
+ *
+ * Best effort, and limited by what the vendored headers expose. The camera
+ * profile's [calib] section holds fx, fy, cx, cy, k1, k2, k3, p1, p2
+ * (OakCDKCameraNormal.conf, doc/ConfigurationFilesDescription.md), the same
+ * nine numbers PointCloudFrameGenerator::setParameters takes
+ * (PointCloudFrameGenerator.h:26-28) and that the vendor's ROS wrapper reads
+ * back as parameters through DepthCamera::get and publishes as an OpenCV
+ * "plumb_bob" camera_info (wrappers/pointcloud_ros/.../base_pointcloud_node.cpp
+ * :452-475). That fixes the names and the model; three things no header in
+ * 3rdparty/oaksdk states:
+ *  - the resolution the numbers are for. They are taken to be the sensor's
+ *    full frame (getMaximumFrameSize) and scaled to the delivered one, which
+ *    is what PointCloudTransform::rescaleParameters exists for
+ *    (PointCloudTransform.h:66);
+ *  - whether they follow the img_orientation_h/v flips. They are calibrated
+ *    with the profile that sets those flips, and are reported as they are;
+ *  - whether DepthFrame::depth is a z-depth or a radial range: Frame.h:58
+ *    says only "Unit: meters".
+ */
+int backend_get_intrinsics(depthcam_device* dev, uint32_t stream, depthcam_intrinsics* out)
+{
+  if(!dev || !dev->camera || !out)
+    return 0;
+  if(stream != DEPTHCAM_STREAM_DEPTH && stream != DEPTHCAM_STREAM_IR
+     && stream != DEPTHCAM_STREAM_POINTCLOUD)
+    return 0;
+
+  try
+  {
+    double fx{}, fy{}, cx{}, cy{}, k1{}, k2{}, k3{}, p1{}, p2{};
+    const auto& cam = *dev->camera;
+    if(!read_number(cam, "fx", fx) || !read_number(cam, "fy", fy)
+       || !read_number(cam, "cx", cx) || !read_number(cam, "cy", cy))
+      return 0;
+    if(fx <= 0. || fy <= 0.)
+      return 0;
+    // Absent coefficients are zero, as in the documentation's example profile.
+    read_number(cam, "k1", k1);
+    read_number(cam, "k2", k2);
+    read_number(cam, "k3", k3);
+    read_number(cam, "p1", p1);
+    read_number(cam, "p2", p2);
+
+    uint32_t w = dev->frame_w.load(std::memory_order_relaxed);
+    uint32_t h = dev->frame_h.load(std::memory_order_relaxed);
+    if(w == 0 || h == 0)
+    {
+      w = uint32_t(dev->width);
+      h = uint32_t(dev->height);
+    }
+    if(w == 0 || h == 0)
+      return 0;
+
+    double sx = 1., sy = 1.;
+    PointCloud::FrameSize full{};
+    if(dev->camera->getMaximumFrameSize(full) && full.width > 0 && full.height > 0)
+    {
+      sx = double(w) / full.width;
+      sy = double(h) / full.height;
+    }
+
+    depthcam_intrinsics r{};
+    r.struct_size = out->struct_size;
+    r.width = int32_t(w);
+    r.height = int32_t(h);
+    r.fx = float(fx * sx);
+    r.fy = float(fy * sy);
+    r.cx = float(cx * sx);
+    r.cy = float(cy * sy);
+    r.model = DEPTHCAM_DISTORTION_BROWN_CONRADY;
+    r.coeffs[0] = float(k1);
+    r.coeffs[1] = float(k2);
+    r.coeffs[2] = float(k3);
+    r.coeffs[6] = float(p1);
+    r.coeffs[7] = float(p2);
+    std::memcpy(out, &r, std::min<std::size_t>(out->struct_size, sizeof(r)));
+    return 1;
+  }
+  catch(...)
+  {
+    return 0;
+  }
+}
+
+int backend_get_extrinsics(
+    depthcam_device* dev, uint32_t from, uint32_t to, depthcam_extrinsics* out)
+{
+  if(!dev || !out)
+    return 0;
+  // One sensor: depth, IR (its amplitude) and the cloud share a frame. There
+  // is nothing else on these modules to relate them to.
+  const auto ours = [](uint32_t s) {
+    return s == DEPTHCAM_STREAM_DEPTH || s == DEPTHCAM_STREAM_IR
+           || s == DEPTHCAM_STREAM_POINTCLOUD;
+  };
+  if(!ours(from) || !ours(to))
+    return 0;
+
+  depthcam_extrinsics r{};
+  r.struct_size = out->struct_size;
+  r.rotation[0] = r.rotation[4] = r.rotation[8] = 1.f;
+  std::memcpy(out, &r, std::min<std::size_t>(out->struct_size, sizeof(r)));
+  return 1;
+}
+
+int backend_get_details(depthcam_device* dev, depthcam_device_details* out)
+{
+  if(!dev || !out)
+    return 0;
+
+  depthcam_device_details r{};
+  r.struct_size = out->struct_size;
+  r.model = dev->name.c_str();
+  r.serial = dev->serial.c_str();
+  // libPointCloud reports no firmware version.
+  r.firmware = "";
+  // The ToF sensor chip ("MLX75027"...), the closest thing to a hardware
+  // revision DepthCamera exposes.
+  r.hardware_rev = dev->chipset.c_str();
+
+  // Both in metres; see curated_controls.
+  try
+  {
+    if(dev->camera)
+    {
+      double near_m{}, range_m{};
+      if(read_number(*dev->camera, "near_distance", near_m))
+        r.depth_min_m = float(near_m);
+      if(read_number(*dev->camera, "unambiguous_range", range_m))
+        r.depth_max_m = float(range_m);
+    }
+  }
+  catch(...)
+  {
+  }
+
+  std::memcpy(out, &r, std::min<std::size_t>(out->struct_size, sizeof(r)));
+  return 1;
+}
+
+/**
+ * The SDK only lists modes for a connected camera
+ * (DepthCamera::getSupportedVideoModes), and connecting claims it, so this
+ * answers for a camera this process already has open and declines otherwise:
+ * no table of modes ships with the SDK to fall back on.
+ */
+int backend_list_profiles(const char* uri, uint32_t stream, depthcam_profile_cb cb, void* user)
+{
+  if(!cb)
+    return 0;
+  if(stream != DEPTHCAM_STREAM_DEPTH && stream != DEPTHCAM_STREAM_IR)
+    return 0;
+
+  try
+  {
+    const auto addr = parse_uri(uri);
+
+    std::lock_guard<std::recursive_mutex> lock{g_system_mutex};
+    for(auto* dev : g_open_devices)
+    {
+      if(!dev || !dev->camera)
+        continue;
+      const bool match = (addr.kind == Address::Id && dev->uri == "oak:id:" + addr.text)
+                         || (addr.kind == Address::Serial && dev->serial == addr.text);
+      if(!match)
+        continue;
+
+      std::vector<PointCloud::SupportedVideoMode> modes;
+      if(!dev->camera->getSupportedVideoModes(modes) || modes.empty())
+        return 0;
+
+      for(const auto& m : modes)
+      {
+        depthcam_profile p{};
+        p.struct_size = sizeof(p);
+        p.width = int32_t(m.frameSize.width);
+        p.height = int32_t(m.frameSize.height);
+        p.fps = int32_t(std::lround(m.getFrameRate()));
+        // Depth and amplitude are both delivered as float images, whatever
+        // the sensor's raw bytesPerPixel.
+        p.format = DEPTHCAM_FMT_GRAYF32;
+        cb(&p, user);
+      }
+      return 1;
+    }
+    return 0;
+  }
+  catch(...)
+  {
+    return 0;
+  }
+}
+
+void backend_set_stream_demand(depthcam_device* dev, uint32_t streams)
+{
+  if(dev)
+    dev->demand.store(streams, std::memory_order_relaxed);
+}
+
 const depthcam_backend_v1 g_backend{
     .abi_version = DEPTHCAM_ABI_VERSION,
     .name = "oak",
@@ -1318,6 +1639,14 @@ const depthcam_backend_v1 g_backend{
     .get_control = &backend_get_control,
     .set_control = &backend_set_control,
     .active_streams = &backend_active_streams,
+    .get_intrinsics = &backend_get_intrinsics,
+    .get_extrinsics = &backend_get_extrinsics,
+    .get_details = &backend_get_details,
+    .get_ray_table = nullptr,
+    .list_controls2 = &backend_list_controls2,
+    .set_control_changed_callback = nullptr,
+    .list_profiles = &backend_list_profiles,
+    .set_stream_demand = &backend_set_stream_demand,
 };
 
 } // namespace
