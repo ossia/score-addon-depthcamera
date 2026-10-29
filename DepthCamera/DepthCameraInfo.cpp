@@ -5,6 +5,8 @@
 
 #include <DepthCamera/DepthCameraStream.hpp>
 
+#include <ossia-qt/invoke.hpp>
+
 #include <cmath>
 
 namespace Gfx::DepthCamera
@@ -338,6 +340,11 @@ void InfoTree::onStats(const StreamOutput& out, const StreamStats& st)
 
   if(n.device_time)
     n.device_time->set_value(float(st.device_time_ms));
+
+  // The first depth frame of a start: what the camera reports may only now
+  // be known, and the stream's size certainly is.
+  if(out.stream == DEPTHCAM_STREAM_DEPTH && st.frames == 1)
+    ossia::qt::run_async(&m_context, [this] { refresh(); });
 
   if(out.stream == DEPTHCAM_STREAM_DEPTH && m_unit)
   {
