@@ -316,6 +316,7 @@ add_library(score_addon_orbbec
   DepthCamera/DepthCameraDevice.cpp
   DepthCamera/DepthCameraProtocol.hpp
   DepthCamera/DepthCameraProtocol.cpp
+  DepthCamera/DepthCameraPointCloud.hpp
   DepthCamera/DepthCameraControls.hpp
   DepthCamera/DepthCameraControls.cpp
   DepthCamera/DepthCameraImu.hpp
@@ -366,4 +367,46 @@ setup_score_plugin(score_addon_orbbec)
 if(SCORE_TESTING AND COMMAND score_add_test)
   include("${CMAKE_CURRENT_SOURCE_DIR}/Backends/Synthetic/Synthetic.cmake")
   add_subdirectory(Tests)
+endif()
+
+### What a frame costs, CPU path against GPU path. Built with the tests, or on
+### its own -- in a release build, where the numbers mean something -- with
+### -DSCORE_DEPTHCAM_PERF=ON.
+option(SCORE_DEPTHCAM_PERF "Build the depth camera performance harness" OFF)
+if(SCORE_DEPTHCAM_PERF OR (SCORE_TESTING AND COMMAND score_add_test))
+  include("${CMAKE_CURRENT_SOURCE_DIR}/Backends/Synthetic/Synthetic.cmake")
+  set(_perf_hidden)
+  if(BUILD_SHARED_LIBS AND NOT SCORE_STATIC_PLUGINS)
+    set(_perf_hidden
+      DepthCamera/Backend/BackendRegistry.cpp DepthCamera/DepthCameraCalibration.cpp
+      DepthCamera/DepthCameraGpu.cpp DepthCamera/DepthCameraSettings.cpp
+      DepthCamera/DepthCameraStream.cpp)
+  endif()
+  add_executable(depthcam_perf Tests/perf/DepthCameraPerf.cpp ${_perf_hidden})
+  target_link_libraries(depthcam_perf PRIVATE
+    score_addon_orbbec score_plugin_gfx score_plugin_scenario score_lib_process
+    score_depthcam_synthetic_impl ${QT_PREFIX}::Gui ${QT_PREFIX}::Widgets)
+  target_include_directories(depthcam_perf PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/DepthCamera/Backend"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Backends/Synthetic"
+    "${SCORE_ROOT_SOURCE_DIR}/tests/fixtures"
+    $<TARGET_PROPERTY:score_addon_orbbec,INCLUDE_DIRECTORIES>)
+  if(FFMPEG_INCLUDE_DIRS)
+    target_include_directories(depthcam_perf SYSTEM PRIVATE ${FFMPEG_INCLUDE_DIRS})
+  endif()
+  set_target_properties(depthcam_perf PROPERTIES SCORE_CUSTOM_PCH 1)
+  if(COMMAND setup_score_common_exe_features)
+    setup_score_common_exe_features(depthcam_perf)
+  endif()
+  # A static build registers its plug-ins by linking all of them, once the
+  # list is complete.
+  if(SCORE_STATIC_PLUGINS OR NOT BUILD_SHARED_LIBS)
+    function(_depthcam_perf_link_plugins)
+      set(_p "${SCORE_PLUGINS_LIST}")
+      list(REMOVE_ITEM _p score_plugin_jit)
+      target_link_libraries(depthcam_perf PRIVATE ${_p})
+    endfunction()
+    cmake_language(DEFER DIRECTORY "${SCORE_ROOT_SOURCE_DIR}"
+      CALL _depthcam_perf_link_plugins)
+  endif()
 endif()

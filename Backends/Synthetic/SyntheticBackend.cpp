@@ -8,11 +8,16 @@
 #include <condition_variable>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <time.h>
+#endif
 
 #if !defined(SYNTHETIC_ABI_VERSION)
 #define SYNTHETIC_ABI_VERSION DEPTHCAM_ABI_VERSION
@@ -182,9 +187,26 @@ const depthcam_control2* findControl(std::string_view id)
   return nullptr;
 }
 
+/// A frame's samples. Not a std::vector: an unoptimised build destroys one
+/// element at a time, which at 1280x720 costs milliseconds -- in the host's
+/// thread, when it hands the previous frame back -- and would be measured as
+/// the host's cost.
+struct Buffer
+{
+  std::unique_ptr<uint8_t[]> data;
+  std::size_t size{};
+
+  explicit Buffer(std::size_t n)
+      : data{new uint8_t[n]}
+      , size{n}
+  {
+  }
+  uint8_t* bytes() noexcept { return data.get(); }
+};
+
 struct FrameHolder
 {
-  std::vector<uint8_t> bytes;
+  Buffer bytes;
 };
 
 void releaseFrame(void* owner)
@@ -199,6 +221,19 @@ Counters& counters()
 {
   static Counters c;
   return c;
+}
+
+int64_t threadCpuNs() noexcept
+{
+#if !defined(_WIN32)
+  timespec ts{};
+  clock_gettime(CLOCK_THREAD_CPUTIME_ID, &ts);
+  return int64_t(ts.tv_sec) * 1'000'000'000 + ts.tv_nsec;
+#else
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+#endif
 }
 
 }
@@ -280,7 +315,7 @@ namespace
 {
 
 void deliver(depthcam_device& d, uint32_t stream, int fmt, int w, int h,
-             std::vector<uint8_t>&& bytes, uint64_t ts, float unit = 0.f, int points = 0)
+             Buffer&& bytes, uint64_t ts, float unit = 0.f, int points = 0)
 {
   auto* holder = new FrameHolder{std::move(bytes)};
   depthcam_frame f{};
@@ -290,14 +325,16 @@ void deliver(depthcam_device& d, uint32_t stream, int fmt, int w, int h,
   f.height = h;
   f.stride = 0;
   f.timestamp_ns = ts;
-  f.data = holder->bytes.data();
-  f.bytes = holder->bytes.size();
+  f.data = holder->bytes.bytes();
+  f.bytes = holder->bytes.size;
   f.depth_unit_mm = unit;
   f.point_count = points;
   f.owner = holder;
   f.release = &releaseFrame;
   counters().frames_delivered.fetch_add(1, std::memory_order_relaxed);
+  const auto t0 = threadCpuNs();
   d.cb(&f, d.user);
+  counters().host_callback_ns.fetch_add(threadCpuNs() - t0, std::memory_order_relaxed);
 }
 
 /// Renders and delivers one frame of every opened stream.
@@ -347,13 +384,13 @@ void produce(depthcam_device& d)
   if(want & DEPTHCAM_STREAM_DEPTH)
   {
     const std::size_t n = std::size_t(dw) * dh;
-    std::vector<uint8_t> bytes;
+    const bool u16 = d.opts.unit == Unit::Mm16 || d.opts.unit == Unit::TenthMm16;
+    Buffer bytes{n * (u16 ? 2 : 4)};
     int fmt{};
-    if(d.opts.unit == Unit::Mm16 || d.opts.unit == Unit::TenthMm16)
+    if(u16)
     {
       const double scale = d.opts.unit == Unit::Mm16 ? 1000. : 10000.;
-      bytes.resize(n * 2);
-      auto* p = reinterpret_cast<uint16_t*>(bytes.data());
+      auto* p = reinterpret_cast<uint16_t*>(bytes.bytes());
       for(std::size_t i = 0; i < n; i++)
         p[i] = uint16_t(std::min(65535., std::round(metres[i] * scale)));
       fmt = DEPTHCAM_FMT_GRAY16;
@@ -361,8 +398,7 @@ void produce(depthcam_device& d)
     else
     {
       const double scale = d.opts.unit == Unit::FloatMm ? 1000. : 1.;
-      bytes.resize(n * 4);
-      auto* p = reinterpret_cast<float*>(bytes.data());
+      auto* p = reinterpret_cast<float*>(bytes.bytes());
       for(std::size_t i = 0; i < n; i++)
         p[i] = float(metres[i] * scale);
       fmt = DEPTHCAM_FMT_GRAYF32;
@@ -374,16 +410,16 @@ void produce(depthcam_device& d)
   if(want & DEPTHCAM_STREAM_IR)
   {
     const std::size_t n = std::size_t(d.irW) * d.irH;
-    std::vector<uint8_t> bytes(n * (d.opts.irFloat ? 4 : 2));
+    Buffer bytes{n * (d.opts.irFloat ? 4 : 2)};
     for(int v = 0; v < d.irH; v++)
       for(int u = 0; u < d.irW; u++)
       {
         const auto i = std::size_t(v) * d.irW + u;
         const uint16_t ir = irAt(u, v, frame, laser);
         if(d.opts.irFloat)
-          reinterpret_cast<float*>(bytes.data())[i] = float(ir);
+          reinterpret_cast<float*>(bytes.bytes())[i] = float(ir);
         else
-          reinterpret_cast<uint16_t*>(bytes.data())[i] = ir;
+          reinterpret_cast<uint16_t*>(bytes.bytes())[i] = ir;
       }
     deliver(d, DEPTHCAM_STREAM_IR,
             d.opts.irFloat ? DEPTHCAM_FMT_GRAYF32 : DEPTHCAM_FMT_GRAY16, d.irW, d.irH,
@@ -393,12 +429,12 @@ void produce(depthcam_device& d)
   if(want & DEPTHCAM_STREAM_COLOR)
   {
     const Camera cc = colorCamera(d.colorW, d.colorH);
-    std::vector<uint8_t> bytes(std::size_t(d.colorW) * d.colorH * 3);
+    Buffer bytes{std::size_t(d.colorW) * d.colorH * 3};
     for(int v = 0; v < d.colorH; v++)
       for(int u = 0; u < d.colorW; u++)
       {
         const auto c = colorAt(cc, u, v, frame);
-        std::memcpy(&bytes[(std::size_t(v) * d.colorW + u) * 3], c.data(), 3);
+        std::memcpy(bytes.bytes() + (std::size_t(v) * d.colorW + u) * 3, c.data(), 3);
       }
     deliver(d, DEPTHCAM_STREAM_COLOR, DEPTHCAM_FMT_RGB24, d.colorW, d.colorH,
             std::move(bytes), ts);
@@ -409,9 +445,10 @@ void produce(depthcam_device& d)
     // Organised: one point per depth pixel, zeros where there is no depth,
     // like the SDK clouds.
     counters().pointclouds_computed.fetch_add(1, std::memory_order_relaxed);
+    const auto t0 = threadCpuNs();
     const std::size_t n = std::size_t(dw) * dh;
-    std::vector<uint8_t> bytes(n * 3 * sizeof(float));
-    auto* p = reinterpret_cast<float*>(bytes.data());
+    Buffer bytes{n * 3 * sizeof(float)};
+    auto* p = reinterpret_cast<float*>(bytes.bytes());
     for(int v = 0; v < dh; v++)
       for(int u = 0; u < dw; u++)
       {
@@ -422,6 +459,7 @@ void produce(depthcam_device& d)
         p[3 * i + 1] = z > 0 ? float(r[1] * z) : 0.f;
         p[3 * i + 2] = float(z);
       }
+    counters().pointcloud_ns.fetch_add(threadCpuNs() - t0, std::memory_order_relaxed);
     deliver(d, DEPTHCAM_STREAM_POINTCLOUD, DEPTHCAM_FMT_XYZ, int(n), 1, std::move(bytes),
             ts, 0.f, int(n));
   }
@@ -434,8 +472,8 @@ void produce(depthcam_device& d)
     s.fields = DEPTHCAM_IMU_ACCEL | DEPTHCAM_IMU_GYRO | DEPTHCAM_IMU_TEMPERATURE;
     s.accel[1] = -9.80665f;
     s.temperature_c = 35.f;
-    std::vector<uint8_t> bytes(sizeof(s));
-    std::memcpy(bytes.data(), &s, sizeof(s));
+    Buffer bytes{sizeof(s)};
+    std::memcpy(bytes.bytes(), &s, sizeof(s));
     deliver(d, DEPTHCAM_STREAM_IMU, DEPTHCAM_FMT_IMU, 1, 1, std::move(bytes), ts);
   }
 }
