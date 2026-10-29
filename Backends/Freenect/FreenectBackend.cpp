@@ -15,9 +15,11 @@
 #include <libfreenect.h>
 #include <libfreenect_registration.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -163,25 +165,49 @@ struct ControlDef
   double min, max, step, def;
   const char* const* labels;
   int label_count;
+  uint32_t flags;
 };
 
 constexpr int no_labels = 0;
 
 const ControlDef freenect_controls[] = {
+    // Volatile: what is read back is where the motor is, which lags a write
+    // and moves on its own when the camera is knocked.
     {"motor/tilt", "tilt", "Tilt angle in degrees from the horizon",
      DEPTHCAM_CONTROL_INT, DEPTHCAM_ACCESS_READ | DEPTHCAM_ACCESS_WRITE, -30, 30, 1,
-     0, nullptr, no_labels},
+     0, nullptr, no_labels, DEPTHCAM_CONTROL_VOLATILE},
     {"motor/led", "LED", nullptr, DEPTHCAM_CONTROL_ENUM,
-     DEPTHCAM_ACCESS_WRITE, 0, 6, 1, 1, led_labels, 7},
+     DEPTHCAM_ACCESS_WRITE, 0, 6, 1, 1, led_labels, 7, 0},
     {"sensors/tilt_status", "tilt status", nullptr, DEPTHCAM_CONTROL_ENUM,
-     DEPTHCAM_ACCESS_READ, 0, 4, 1, 0, tilt_status_labels, 5},
+     DEPTHCAM_ACCESS_READ, 0, 4, 1, 0, tilt_status_labels, 5,
+     DEPTHCAM_CONTROL_VOLATILE},
     {"sensors/accel_x", "acceleration X", "In g", DEPTHCAM_CONTROL_FLOAT,
-     DEPTHCAM_ACCESS_READ, -4, 4, 0, 0, nullptr, no_labels},
+     DEPTHCAM_ACCESS_READ, -4, 4, 0, 0, nullptr, no_labels,
+     DEPTHCAM_CONTROL_VOLATILE},
     {"sensors/accel_y", "acceleration Y", "In g", DEPTHCAM_CONTROL_FLOAT,
-     DEPTHCAM_ACCESS_READ, -4, 4, 0, 0, nullptr, no_labels},
+     DEPTHCAM_ACCESS_READ, -4, 4, 0, 0, nullptr, no_labels,
+     DEPTHCAM_CONTROL_VOLATILE},
     {"sensors/accel_z", "acceleration Z", "In g", DEPTHCAM_CONTROL_FLOAT,
-     DEPTHCAM_ACCESS_READ, -4, 4, 0, 0, nullptr, no_labels},
+     DEPTHCAM_ACCESS_READ, -4, 4, 0, 0, nullptr, no_labels,
+     DEPTHCAM_CONTROL_VOLATILE},
 };
+
+depthcam_control base_of(const ControlDef& d)
+{
+  depthcam_control c{};
+  c.id = d.id;
+  c.name = d.name;
+  c.description = d.description;
+  c.kind = d.kind;
+  c.access = d.access;
+  c.min = d.min;
+  c.max = d.max;
+  c.step = d.step;
+  c.def = d.def;
+  c.enum_labels = d.labels;
+  c.enum_count = d.label_count;
+  return c;
+}
 
 } // namespace
 
@@ -214,6 +240,18 @@ struct depthcam_device
 
   depthcam_open_config cfg{};
   bool color_pointcloud{};
+  /// Depth delivered as FREENECT_DEPTH_REGISTERED, i.e. in the colour image.
+  bool registered{};
+
+  /// Which opened streams the host consumes; see backend_set_stream_demand.
+  std::atomic<uint32_t> demand{~0u};
+
+  /// The camera's zero-plane calibration, read once at open; see
+  /// backend_get_intrinsics.
+  freenect_zero_plane_info zero_plane{};
+  bool have_zero_plane{};
+
+  std::string serial;
 
   std::atomic_bool running{};
   std::thread thread;
@@ -271,8 +309,10 @@ void depthcam_device::onVideo(void* data, uint32_t timestamp)
     return;
 
   const size_t bytes = size_t(color_w) * color_h * 3; // FREENECT_VIDEO_RGB
+  const uint32_t wanted = demand.load(std::memory_order_relaxed);
 
-  const bool want_cloud = (cfg.streams & DEPTHCAM_STREAM_POINTCLOUD) != 0;
+  const bool want_cloud = (cfg.streams & DEPTHCAM_STREAM_POINTCLOUD)
+                          && (wanted & DEPTHCAM_STREAM_POINTCLOUD);
   if(want_cloud && color_pointcloud)
   {
     std::lock_guard lock{pair_mutex};
@@ -281,7 +321,8 @@ void depthcam_device::onVideo(void* data, uint32_t timestamp)
     have_color = true;
   }
 
-  if((cfg.streams & DEPTHCAM_STREAM_COLOR) && on_frame)
+  if((cfg.streams & DEPTHCAM_STREAM_COLOR) && (wanted & DEPTHCAM_STREAM_COLOR)
+     && on_frame)
   {
     auto* holder = new VectorHolder{};
     holder->data.assign(
@@ -309,8 +350,12 @@ void depthcam_device::onDepth(void* data, uint32_t timestamp)
 
   const size_t count = size_t(depth_w) * depth_h;
   const auto* d = static_cast<const uint16_t*>(data);
+  const uint32_t wanted = demand.load(std::memory_order_relaxed);
 
-  const bool want_cloud = (cfg.streams & DEPTHCAM_STREAM_POINTCLOUD) != 0;
+  // The per-pixel freenect_camera_to_world loop is the costly part of this
+  // backend; a cloud nobody reads is neither copied for nor computed.
+  const bool want_cloud = (cfg.streams & DEPTHCAM_STREAM_POINTCLOUD)
+                          && (wanted & DEPTHCAM_STREAM_POINTCLOUD);
   if(want_cloud)
   {
     std::lock_guard lock{pair_mutex};
@@ -318,7 +363,8 @@ void depthcam_device::onDepth(void* data, uint32_t timestamp)
     have_depth = true;
   }
 
-  if((cfg.streams & DEPTHCAM_STREAM_DEPTH) && on_frame)
+  if((cfg.streams & DEPTHCAM_STREAM_DEPTH) && (wanted & DEPTHCAM_STREAM_DEPTH)
+     && on_frame)
   {
     auto* holder = new VectorHolder{};
     holder->data.resize(count * sizeof(uint16_t));
@@ -606,6 +652,7 @@ depthcam_device* backend_open(const char* uri, const depthcam_open_config* confi
     if(found >= 0)
     {
       index = found;
+      dev->serial = addr.serial;
     }
     else if(unidentified_count == 1 && n == 1)
     {
@@ -699,6 +746,18 @@ depthcam_device* backend_open(const char* uri, const depthcam_open_config* confi
   }
   dev->depth_w = depth.width;
   dev->depth_h = depth.height;
+  dev->registered = want_registered;
+
+  // Fetched from the camera by freenect_camera_init during open
+  // (src/cameras.c:1260), so it is valid here. The copy also builds three
+  // lookup tables that are of no use to us, hence freed straight away.
+  {
+    freenect_registration reg = freenect_copy_registration(dev->dev);
+    dev->zero_plane = reg.zero_plane_info;
+    freenect_destroy_registration(&reg);
+    dev->have_zero_plane = dev->zero_plane.reference_distance > 0.f
+                           && dev->zero_plane.reference_pixel_size > 0.f;
+  }
 
   freenect_set_video_callback(dev->dev, &video_cb);
   freenect_set_depth_callback(dev->dev, &depth_cb);
@@ -771,18 +830,25 @@ int backend_list_controls(depthcam_device* dev, depthcam_control_cb cb, void* us
 
   for(const auto& d : freenect_controls)
   {
-    depthcam_control c{};
-    c.id = d.id;
-    c.name = d.name;
-    c.description = d.description;
-    c.kind = d.kind;
-    c.access = d.access;
-    c.min = d.min;
-    c.max = d.max;
-    c.step = d.step;
-    c.def = d.def;
-    c.enum_labels = d.labels;
-    c.enum_count = d.label_count;
+    const depthcam_control c = base_of(d);
+    cb(&c, user);
+  }
+  return 1;
+}
+
+int backend_list_controls2(depthcam_device* dev, depthcam_control2_cb cb, void* user)
+{
+  if(!dev || !cb || !dev->has_motor)
+    return 0;
+
+  for(const auto& d : freenect_controls)
+  {
+    depthcam_control2 c{};
+    c.struct_size = sizeof(c);
+    c.base = base_of(d);
+    // None of the ABI's units fit: these are degrees and g.
+    c.unit = nullptr;
+    c.flags = d.flags;
     cb(&c, user);
   }
   return 1;
@@ -842,6 +908,193 @@ uint32_t backend_active_streams(depthcam_device* dev)
   return streams;
 }
 
+// --- ABI 4 -------------------------------------------------------------------
+
+/**
+ * Nominal colour-camera field of view, from the OpenNI2 driver that ships with
+ * libfreenect (OpenNI2-FreenectDriver/src/ColorStream.hpp:17-19, "from NUI
+ * library"). libfreenect itself has no colour intrinsics at all: neither a
+ * calibration read from the camera nor a constant.
+ */
+constexpr double color_hfov_deg = 62.0;
+constexpr double color_vfov_deg = 48.6;
+
+void fill_color_nominal(const depthcam_device& d, depthcam_intrinsics& r)
+{
+  constexpr double deg = 3.14159265358979323846 / 180.;
+  r.width = d.color_w;
+  r.height = d.color_h;
+  r.fx = float((d.color_w / 2.) / std::tan(color_hfov_deg * deg / 2.));
+  r.fy = float((d.color_h / 2.) / std::tan(color_vfov_deg * deg / 2.));
+  // The optical axis on the image centre, in the ABI's pixel-centre
+  // convention.
+  r.cx = float((d.color_w - 1) / 2.);
+  r.cy = float((d.color_h - 1) / 2.);
+  r.model = DEPTHCAM_DISTORTION_NONE;
+}
+
+int backend_get_intrinsics(depthcam_device* dev, uint32_t stream, depthcam_intrinsics* out)
+{
+  if(!dev || !out)
+    return 0;
+
+  depthcam_intrinsics r{};
+  r.struct_size = out->struct_size;
+
+  switch(stream)
+  {
+    case DEPTHCAM_STREAM_DEPTH:
+    case DEPTHCAM_STREAM_POINTCLOUD:
+      if(dev->registered)
+      {
+        // FREENECT_DEPTH_REGISTERED is depth resampled into the colour image
+        // (libfreenect_registration.h:123-124 calls it the "depth -> RGB"
+        // mapping), so it has the colour camera's geometry.
+        fill_color_nominal(*dev, r);
+      }
+      else
+      {
+        if(!dev->have_zero_plane)
+          return 0;
+        // The model libfreenect itself deprojects with,
+        // freenect_camera_to_world (src/registration.c:341-353):
+        //   x = (u - 320) * 2 * pixel_size * z / reference_distance
+        // with reference_distance "the focal length of the IR camera, in mm"
+        // and pixel_size "the size of a single pixel on the zero plane, in mm"
+        // (libfreenect_registration.h:94-95), and the factor 2 because those
+        // are for the 1280x1024 sensor of which 640x480 is a 2:1 downscale.
+        // So f = reference_distance / (2 pixel_size), the same on both axes,
+        // with the principal point at the image centre and integer pixel
+        // indices as centres -- the ABI's convention as is. No distortion
+        // model exists in libfreenect.
+        const auto& z = dev->zero_plane;
+        const float f = z.reference_distance / (2.f * z.reference_pixel_size);
+        r.width = dev->depth_w;
+        r.height = dev->depth_h;
+        r.fx = f;
+        r.fy = f;
+        r.cx = float(dev->depth_w / 2);
+        r.cy = float(dev->depth_h / 2);
+        r.model = DEPTHCAM_DISTORTION_NONE;
+      }
+      break;
+    case DEPTHCAM_STREAM_COLOR:
+      fill_color_nominal(*dev, r);
+      break;
+    default:
+      return 0;
+  }
+
+  std::memcpy(out, &r, std::min<std::size_t>(out->struct_size, sizeof(r)));
+  return 1;
+}
+
+int backend_get_extrinsics(
+    depthcam_device* dev, uint32_t from, uint32_t to, depthcam_extrinsics* out)
+{
+  if(!dev || !out)
+    return 0;
+
+  const auto is_depth = [](uint32_t s) {
+    return s == DEPTHCAM_STREAM_DEPTH || s == DEPTHCAM_STREAM_POINTCLOUD;
+  };
+
+  float tx = 0.f;
+  if(from == to || (is_depth(from) && is_depth(to)))
+    ;
+  else if(dev->registered
+          && ((is_depth(from) && to == DEPTHCAM_STREAM_COLOR)
+              || (from == DEPTHCAM_STREAM_COLOR && is_depth(to))))
+    ; // registered depth is already in the colour camera's frame
+  else if(is_depth(from) || is_depth(to))
+  {
+    if(!dev->have_zero_plane || !(from == DEPTHCAM_STREAM_COLOR || to == DEPTHCAM_STREAM_COLOR))
+      return 0;
+    // The two cameras sit side by side on one bar, and libfreenect's own
+    // registration treats them as a pure horizontal translation of
+    // dcmos_rcmos_dist, "distance between IR camera and RGB camera, in cm"
+    // (libfreenect_registration.h:93). The sign is the one
+    // freenect_init_depth_to_rgb uses (src/registration.c:59-73): the RGB
+    // column of a point is its IR column plus B (1 - ref / z), whose
+    // depth-dependent part -B ref / z is the parallax f tx / z of a camera
+    // displaced by tx = -dcmos_rcmos_dist. So p_color = p_depth + (tx, 0, 0).
+    // Rotation is taken as identity, as libfreenect does.
+    const float d = -dev->zero_plane.dcmos_rcmos_dist * 0.01f;
+    tx = is_depth(from) ? d : -d;
+  }
+  else
+    return 0;
+
+  depthcam_extrinsics r{};
+  r.struct_size = out->struct_size;
+  r.rotation[0] = r.rotation[4] = r.rotation[8] = 1.f;
+  r.translation[0] = tx;
+  std::memcpy(out, &r, std::min<std::size_t>(out->struct_size, sizeof(r)));
+  return 1;
+}
+
+int backend_get_details(depthcam_device* dev, depthcam_device_details* out)
+{
+  if(!dev || !out)
+    return 0;
+
+  depthcam_device_details r{};
+  r.struct_size = out->struct_size;
+  r.model = "Kinect v1";
+  // Known only when the camera was opened by a serial that the listing
+  // confirmed: listing again here would reset the audio interface on a 1473
+  // (see usable_serial).
+  r.serial = dev->serial.c_str();
+  // libfreenect reads no version or revision from the camera.
+  r.firmware = "";
+  r.hardware_rev = "";
+  // 0 to FREENECT_DEPTH_MM_MAX_VALUE (libfreenect.h:45) is only the encoding;
+  // the measuring range is documented nowhere in libfreenect.
+  r.depth_min_m = 0.f;
+  r.depth_max_m = 0.f;
+  std::memcpy(out, &r, std::min<std::size_t>(out->struct_size, sizeof(r)));
+  return 1;
+}
+
+int backend_list_profiles(const char*, uint32_t stream, depthcam_profile_cb cb, void* user)
+{
+  if(!cb)
+    return 0;
+
+  depthcam_profile p{};
+  p.struct_size = sizeof(p);
+
+  // What backend_open sets, which is the medium-resolution RGB and depth mode
+  // of libfreenect's own mode table (src/cameras.c:45,71-72): 640x480 at 30
+  // fps. The 1280x1024 colour mode exists too, but only at 10 fps and not
+  // alongside depth on every model, and this backend does not offer it.
+  switch(stream)
+  {
+    case DEPTHCAM_STREAM_COLOR:
+      p.width = 640;
+      p.height = 480;
+      p.fps = 30;
+      p.format = DEPTHCAM_FMT_RGB24;
+      cb(&p, user);
+      return 1;
+    case DEPTHCAM_STREAM_DEPTH:
+      p.width = 640;
+      p.height = 480;
+      p.fps = 30;
+      p.format = DEPTHCAM_FMT_GRAY16;
+      cb(&p, user);
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+void backend_set_stream_demand(depthcam_device* dev, uint32_t streams)
+{
+  if(dev)
+    dev->demand.store(streams, std::memory_order_relaxed);
+}
+
 const depthcam_backend_v1 g_backend{
     .abi_version = DEPTHCAM_ABI_VERSION,
     .name = "freenect",
@@ -860,6 +1113,14 @@ const depthcam_backend_v1 g_backend{
     .get_control = &backend_get_control,
     .set_control = &backend_set_control,
     .active_streams = &backend_active_streams,
+    .get_intrinsics = &backend_get_intrinsics,
+    .get_extrinsics = &backend_get_extrinsics,
+    .get_details = &backend_get_details,
+    .get_ray_table = nullptr,
+    .list_controls2 = &backend_list_controls2,
+    .set_control_changed_callback = nullptr,
+    .list_profiles = &backend_list_profiles,
+    .set_stream_demand = &backend_set_stream_demand,
 };
 
 } // namespace
