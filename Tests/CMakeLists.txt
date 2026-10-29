@@ -57,6 +57,8 @@ target_include_directories(score_addon_orbbec_gfx_test PRIVATE
 if(FFMPEG_INCLUDE_DIRS)
   target_include_directories(score_addon_orbbec_gfx_test SYSTEM PRIVATE ${FFMPEG_INCLUDE_DIRS})
 endif()
+target_compile_definitions(score_addon_orbbec_gfx_test PRIVATE
+  DEPTHCAM_PRESET_DIR="${_dc_root}/Presets")
 set_property(TEST score_addon_orbbec_gfx_test APPEND PROPERTY LABELS depthcam gpu)
 
 # The whole device inside score, on the synthetic module: no hidden sources,
