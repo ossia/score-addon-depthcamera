@@ -661,6 +661,23 @@ endif()
 
 option(SCORE_DEPTHCAM_BUILD_OAK "Build the Oak3DVision backend" ON)
 
+### Its Linux binaries pass std::string across their API and were built
+### against libstdc++. Built with libc++ -- the ossia SDK's toolchain -- the
+### backend links (libpointcloud.so is resolved lazily) and then aborts the
+### process at its first call into the SDK. Skip it there.
+if(_oak_platform AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  include(CheckCXXSourceCompiles)
+  check_cxx_source_compiles(
+    "#include <cstddef>\n#if !defined(_LIBCPP_VERSION)\n#error libstdc++\n#endif\nint main() { return 0; }"
+    SCORE_DEPTHCAM_USES_LIBCXX)
+  if(SCORE_DEPTHCAM_USES_LIBCXX)
+    message(STATUS
+      "score-addon-orbbec: skipping the Oak3DVision backend: its SDK binaries "
+      "need libstdc++ and this build uses libc++")
+    set(_oak_platform "")
+  endif()
+endif()
+
 if(SCORE_DEPTHCAM_BUILD_OAK AND _oak_platform
    AND EXISTS "${SCORE_DEPTHCAM_SDK_DIR}/oaksdk/libs/${_oak_platform}/lib")
   set(_oak_root "${SCORE_DEPTHCAM_SDK_DIR}/oaksdk/libs/${_oak_platform}")
@@ -763,7 +780,7 @@ if(SCORE_DEPTHCAM_BUILD_OAK AND _oak_platform
               "${SCORE_DEPTHCAM_BACKEND_DIR}/oak/conf"
       VERBATIM)
   endif()
-elseif(SCORE_DEPTHCAM_BUILD_OAK AND NOT _oak_platform)
+elseif(SCORE_DEPTHCAM_BUILD_OAK AND NOT _oak_platform AND NOT SCORE_DEPTHCAM_USES_LIBCXX)
   message(STATUS
     "score-addon-orbbec: Oak3DVision ships no libPointCloud binary for this "
     "platform, skipping the Oak backend")
