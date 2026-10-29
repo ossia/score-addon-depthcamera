@@ -16,8 +16,12 @@
 
 #include <k4a/k4a.h>
 
+#include <algorithm>
+#include <array>
 #include <atomic>
+#include <cmath>
 #include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -65,6 +69,10 @@ struct K4AApi
   k4a_wait_result_t (*device_get_imu_sample)(k4a_device_t, k4a_imu_sample_t*, int32_t);
   k4a_result_t (*device_get_calibration)(
       k4a_device_t, k4a_depth_mode_t, k4a_color_resolution_t, k4a_calibration_t*);
+  k4a_result_t (*device_get_version)(k4a_device_t, k4a_hardware_version_t*);
+  k4a_result_t (*calibration_2d_to_3d)(
+      const k4a_calibration_t*, const k4a_float2_t*, const float,
+      const k4a_calibration_type_t, const k4a_calibration_type_t, k4a_float3_t*, int*);
 
   k4a_result_t (*device_get_color_control_capabilities)(
       k4a_device_t, k4a_color_control_command_t, bool*, int32_t*, int32_t*, int32_t*,
@@ -184,6 +192,8 @@ bool load_k4a(K4AApi& api, const char* resource_dir)
   sym(api.device_stop_imu, "k4a_device_stop_imu");
   sym(api.device_get_imu_sample, "k4a_device_get_imu_sample");
   sym(api.device_get_calibration, "k4a_device_get_calibration");
+  sym(api.device_get_version, "k4a_device_get_version");        // k4a.h:1406
+  sym(api.calibration_2d_to_3d, "k4a_calibration_2d_to_3d"); // k4a.h:1809
   sym(api.device_get_color_control_capabilities,
       "k4a_device_get_color_control_capabilities");
   sym(api.device_get_color_control, "k4a_device_get_color_control");
@@ -379,15 +389,68 @@ constexpr ColorControlDef color_controls[] = {
 
 struct ControlEntry
 {
-  /// The command this addresses, or -1 for the two that are not colour
-  /// controls: the auto/manual switches and the temperature readout.
+  /// The command this addresses, or -1 for the ones that are not colour
+  /// controls: the temperature readout and the depth mode. The `_auto`
+  /// switches carry their value's command.
   int command{-1};
   bool is_mode{};      ///< the `_auto` switch rather than the value
   bool is_temperature{};
+  bool is_depth_mode{};
   std::string path;
   std::string name;
-  depthcam_control desc{};
+  std::string auto_control;
+  std::vector<const char*> labels;
+  depthcam_control2 desc{};
 };
+
+/// "50 Hz" for 1 and "60 Hz" for 2 (k4atypes.h, K4A_COLOR_CONTROL_POWERLINE_FREQUENCY).
+constexpr const char* powerline_labels[] = {"50 Hz", "60 Hz"};
+
+/// Indexed by k4a_depth_mode_t from K4A_DEPTH_MODE_NFOV_2X2BINNED (k4atypes.h:292-297).
+constexpr const char* depth_mode_labels[] = {
+    "NFOV 2x2 binned (320x288)", "NFOV unbinned (640x576)", "WFOV 2x2 binned (512x512)",
+    "WFOV unbinned (1024x1024)", "Passive IR (1024x1024)",
+};
+
+/**
+ * @brief The operating range of a depth mode, in metres.
+ *
+ * Not in the SDK headers: these are the Azure Kinect DK hardware
+ * specification's figures ("Depth camera supported operating modes"), which
+ * k4atypes.h:274 defers to. Passive IR measures no depth.
+ */
+std::pair<float, float> depth_range_of(k4a_depth_mode_t m)
+{
+  switch(m)
+  {
+    case K4A_DEPTH_MODE_NFOV_2X2BINNED:
+      return {0.5f, 5.46f};
+    case K4A_DEPTH_MODE_NFOV_UNBINNED:
+      return {0.5f, 3.86f};
+    case K4A_DEPTH_MODE_WFOV_2X2BINNED:
+      return {0.25f, 2.88f};
+    case K4A_DEPTH_MODE_WFOV_UNBINNED:
+      return {0.25f, 2.21f};
+    default:
+      return {0.f, 0.f};
+  }
+}
+
+/**
+ * @brief 30 fps is not offered in WFOV unbinned nor at 3072p; 15 is the
+ * fastest those run at.
+ *
+ * Likewise from the hardware specification, not the headers (k4atypes.h:274).
+ * k4a_device_start_cameras refuses the combination outright, so asking for it
+ * is better turned into the nearest one that works.
+ */
+void clamp_fps(k4a_device_configuration_t& c)
+{
+  if(c.camera_fps == K4A_FRAMES_PER_SECOND_30
+     && (c.depth_mode == K4A_DEPTH_MODE_WFOV_UNBINNED
+         || c.color_resolution == K4A_COLOR_RESOLUTION_3072P))
+    c.camera_fps = K4A_FRAMES_PER_SECOND_15;
+}
 
 } // namespace
 
@@ -397,8 +460,25 @@ struct depthcam_device
 {
   k4a_device_t dev{};
   uint32_t index{};
+  /// Written only while the capture thread is stopped (open, and start() on a
+  /// depth mode change); the lock is for the ABI 4 readers on other threads.
+  std::mutex calib_lock;
   k4a_calibration_t calibration{};
+  k4a_device_configuration_t k4acfg{};
   k4a_transformation_t transformation{};
+
+  /// depth/mode as last written: REQUIRES_RESTART, so start() applies it.
+  int depth_mode_request{};
+  bool applyDepthMode();
+
+  /// Which opened streams the host consumes; see set_stream_demand.
+  std::atomic<uint32_t> demand{~0u};
+
+  std::string serial, firmware;
+
+  /// get_ray_table's answer for `rays_mode`; see backend_get_ray_table.
+  std::vector<float> rays;
+  int rays_mode{-1};
 
   depthcam_open_config cfg{};
   bool color_pointcloud{};
@@ -640,14 +720,17 @@ void depthcam_device::handleCapture(k4a_capture_t capture)
   k4a_image_t ir = g_k4a.capture_get_ir_image(capture);
 
   // Each stream independently: a capture missing colour must still yield depth,
-  // IR and the point cloud.
-  if(cfg.streams & DEPTHCAM_STREAM_COLOR)
+  // IR and the point cloud. What nobody consumes is not delivered -- above all
+  // the cloud, whose transformation and conversion pass cost more than the
+  // rest of the capture.
+  const uint32_t want = cfg.streams & demand.load(std::memory_order_acquire);
+  if(want & DEPTHCAM_STREAM_COLOR)
     emitImage(DEPTHCAM_STREAM_COLOR, color, 0.f);
-  if(cfg.streams & DEPTHCAM_STREAM_IR)
+  if(want & DEPTHCAM_STREAM_IR)
     emitImage(DEPTHCAM_STREAM_IR, ir, 0.f);
-  if(cfg.streams & DEPTHCAM_STREAM_DEPTH)
+  if(want & DEPTHCAM_STREAM_DEPTH)
     emitImage(DEPTHCAM_STREAM_DEPTH, depth, 1.f); // DEPTH16 is millimetres
-  if(cfg.streams & DEPTHCAM_STREAM_POINTCLOUD)
+  if(want & DEPTHCAM_STREAM_POINTCLOUD)
     emitPointCloud(depth, color);
 
   for(auto img : {color, depth, ir})
@@ -755,13 +838,45 @@ void depthcam_device::scanControls()
     e.command = int(def.command);
     e.path = std::string{"color/"} + def.slug;
     e.name = def.slug;
-    e.desc.kind = DEPTHCAM_CONTROL_INT;
-    e.desc.access = DEPTHCAM_ACCESS_READ | DEPTHCAM_ACCESS_WRITE;
-    e.desc.min = min;
-    e.desc.max = max;
-    e.desc.step = step > 0 ? step : 1;
-    e.desc.def = def_value;
-    e.desc.description = def.description;
+    auto& d = e.desc.base;
+    d.kind = DEPTHCAM_CONTROL_INT;
+    d.access = DEPTHCAM_ACCESS_READ | DEPTHCAM_ACCESS_WRITE;
+    d.min = min;
+    d.max = max;
+    d.step = step > 0 ? step : 1;
+    d.def = def_value;
+    d.description = def.description;
+
+    // Units as k4atypes.h states them for each command.
+    switch(def.command)
+    {
+      case K4A_COLOR_CONTROL_EXPOSURE_TIME_ABSOLUTE:
+        e.desc.unit = "us"; // "Exposure time is measured in microseconds."
+        break;
+      case K4A_COLOR_CONTROL_WHITEBALANCE:
+        e.desc.unit = "K"; // "The unit is degrees Kelvin."
+        break;
+      case K4A_COLOR_CONTROL_POWERLINE_FREQUENCY:
+        if(min == 1 && max == 2 && d.step == 1)
+        {
+          d.kind = DEPTHCAM_CONTROL_ENUM;
+          e.labels.assign(std::begin(powerline_labels), std::end(powerline_labels));
+        }
+        e.desc.flags |= DEPTHCAM_CONTROL_ADVANCED;
+        break;
+      case K4A_COLOR_CONTROL_BACKLIGHT_COMPENSATION:
+        e.desc.flags |= DEPTHCAM_CONTROL_ADVANCED;
+        break;
+      default:
+        break;
+    }
+
+    if(supports_auto)
+    {
+      // While the switch is on the camera picks the value itself.
+      e.auto_control = std::string{"color/"} + def.slug + "_auto";
+      e.desc.flags |= DEPTHCAM_CONTROL_VOLATILE;
+    }
     controls.push_back(std::move(e));
 
     if(supports_auto)
@@ -771,14 +886,44 @@ void depthcam_device::scanControls()
       m.is_mode = true;
       m.path = std::string{"color/"} + def.slug + "_auto";
       m.name = std::string{def.slug} + " auto";
-      m.desc.kind = DEPTHCAM_CONTROL_BOOL;
-      m.desc.access = DEPTHCAM_ACCESS_READ | DEPTHCAM_ACCESS_WRITE;
-      m.desc.min = 0;
-      m.desc.max = 1;
-      m.desc.step = 1;
-      m.desc.def = def_mode == K4A_COLOR_CONTROL_MODE_AUTO ? 1 : 0;
+      auto& md = m.desc.base;
+      md.kind = DEPTHCAM_CONTROL_BOOL;
+      md.access = DEPTHCAM_ACCESS_READ | DEPTHCAM_ACCESS_WRITE;
+      md.min = 0;
+      md.max = 1;
+      md.step = 1;
+      md.def = def_mode == K4A_COLOR_CONTROL_MODE_AUTO ? 1 : 0;
       controls.push_back(std::move(m));
     }
+  }
+
+  k4a_depth_mode_t mode{};
+  {
+    std::lock_guard l{calib_lock};
+    mode = k4acfg.depth_mode;
+  }
+  // Only with the depth camera on: a colour-only open has no mode to pick.
+  if(mode != K4A_DEPTH_MODE_OFF)
+  {
+    ControlEntry m;
+    m.is_depth_mode = true;
+    m.path = "depth/mode";
+    m.name = "depth mode";
+    auto& d = m.desc.base;
+    d.kind = DEPTHCAM_CONTROL_ENUM;
+    d.access = DEPTHCAM_ACCESS_READ | DEPTHCAM_ACCESS_WRITE;
+    d.min = K4A_DEPTH_MODE_NFOV_2X2BINNED;
+    d.max = K4A_DEPTH_MODE_PASSIVE_IR;
+    d.step = 1;
+    d.def = mode;
+    d.description
+        = "Field of view and binning of the depth camera. Passive IR delivers "
+          "infrared only, without depth.";
+    m.labels.assign(std::begin(depth_mode_labels), std::end(depth_mode_labels));
+    // libk4a takes the mode in k4a_device_start_cameras only (k4atypes.h,
+    // k4a_device_configuration_t::depth_mode).
+    m.desc.flags = DEPTHCAM_CONTROL_REQUIRES_RESTART;
+    controls.push_back(std::move(m));
   }
 
   if(g_k4a.capture_get_temperature_c)
@@ -787,22 +932,27 @@ void depthcam_device::scanControls()
     t.is_temperature = true;
     t.path = "sensors/temperature";
     t.name = "temperature";
-    t.desc.kind = DEPTHCAM_CONTROL_FLOAT;
-    t.desc.access = DEPTHCAM_ACCESS_READ;
-    t.desc.min = -40;
-    t.desc.max = 125;
-    t.desc.step = 0;
-    t.desc.def = 0;
-    t.desc.description
-        = "Colour sensor temperature in degrees Celsius, as of the last capture";
+    auto& d = t.desc.base;
+    d.kind = DEPTHCAM_CONTROL_FLOAT;
+    d.access = DEPTHCAM_ACCESS_READ;
+    d.min = -40;
+    d.max = 125;
+    d.step = 0;
+    d.def = 0;
+    d.description = "Colour sensor temperature in degrees Celsius, as of the last capture";
+    t.desc.flags = DEPTHCAM_CONTROL_VOLATILE;
     controls.push_back(std::move(t));
   }
 
   // After the vector has stopped reallocating.
   for(auto& e : controls)
   {
-    e.desc.id = e.path.c_str();
-    e.desc.name = e.name.c_str();
+    e.desc.struct_size = sizeof(depthcam_control2);
+    e.desc.base.id = e.path.c_str();
+    e.desc.base.name = e.name.c_str();
+    e.desc.base.enum_labels = e.labels.empty() ? nullptr : e.labels.data();
+    e.desc.base.enum_count = int32_t(e.labels.size());
+    e.desc.auto_control = e.auto_control.empty() ? nullptr : e.auto_control.c_str();
   }
 }
 
@@ -816,12 +966,83 @@ ControlEntry* depthcam_device::findControl(const char* id)
   return nullptr;
 }
 
+bool depthcam_device::applyDepthMode()
+{
+  int requested{};
+  {
+    std::lock_guard l{control_lock};
+    requested = depth_mode_request;
+  }
+  if(k4acfg.depth_mode == K4A_DEPTH_MODE_OFF || requested == int(k4acfg.depth_mode))
+    return true;
+
+  k4a_device_configuration_t next = k4acfg;
+  next.depth_mode = k4a_depth_mode_t(requested);
+  clamp_fps(next);
+
+  k4a_calibration_t cal{};
+  if(g_k4a.device_get_calibration(dev, next.depth_mode, next.color_resolution, &cal)
+     != K4A_RESULT_SUCCEEDED)
+  {
+    set_error("could not read the Azure Kinect calibration for the new depth mode");
+    std::lock_guard l{control_lock};
+    depth_mode_request = k4acfg.depth_mode;
+    return false;
+  }
+
+  // The mode is part of k4a_device_start_cameras' configuration, so the
+  // cameras go down and up again. stop() has already stopped the IMU, which
+  // libk4a only runs while the cameras do.
+  g_k4a.device_stop_cameras(dev);
+  if(g_k4a.device_start_cameras(dev, &next) != K4A_RESULT_SUCCEEDED)
+  {
+    set_error("the Azure Kinect refused the new depth mode; keeping the previous one");
+    g_k4a.device_start_cameras(dev, &k4acfg);
+    std::lock_guard l{control_lock};
+    depth_mode_request = k4acfg.depth_mode;
+    return false;
+  }
+
+  // Everything sized or computed for the previous mode.
+  for(auto* img : {&xyz_image, &transformed_color, &transformed_depth})
+    if(*img)
+    {
+      g_k4a.image_release(*img);
+      *img = nullptr;
+    }
+
+  std::lock_guard l{calib_lock};
+  calibration = cal;
+  k4acfg = next;
+  rays.clear();
+  rays_mode = -1;
+  if(transformation)
+  {
+    g_k4a.transformation_destroy(transformation);
+    transformation = g_k4a.transformation_create(&calibration);
+    if(!transformation)
+      set_error("could not create the Azure Kinect transformation");
+  }
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 
 namespace
 {
 
 int backend_list_controls(depthcam_device* dev, depthcam_control_cb cb, void* user)
+{
+  if(!dev || !cb)
+    return 0;
+  std::lock_guard lock{dev->control_lock};
+  dev->scanControls();
+  for(const auto& e : dev->controls)
+    cb(&e.desc.base, user);
+  return 1;
+}
+
+int backend_list_controls2(depthcam_device* dev, depthcam_control2_cb cb, void* user)
 {
   if(!dev || !cb)
     return 0;
@@ -846,6 +1067,11 @@ int backend_get_control(depthcam_device* dev, const char* id, double* out)
     *out = dev->temperature.load(std::memory_order_relaxed);
     return 1;
   }
+  if(e->is_depth_mode)
+  {
+    *out = dev->depth_mode_request;
+    return 1;
+  }
 
   if(!g_k4a.device_get_color_control)
     return 0;
@@ -863,11 +1089,22 @@ int backend_get_control(depthcam_device* dev, const char* id, double* out)
 
 int backend_set_control(depthcam_device* dev, const char* id, double value)
 {
-  if(!dev || !g_k4a.device_set_color_control || !g_k4a.device_get_color_control)
+  if(!dev)
     return 0;
   std::lock_guard lock{dev->control_lock};
   auto* e = dev->findControl(id);
   if(!e || e->is_temperature)
+    return 0;
+
+  if(e->is_depth_mode)
+  {
+    // Applied by the next start(): the host stops the stream around this.
+    const double v = std::clamp(std::round(value), e->desc.base.min, e->desc.base.max);
+    dev->depth_mode_request = int(v);
+    return 1;
+  }
+
+  if(!g_k4a.device_set_color_control || !g_k4a.device_get_color_control)
     return 0;
 
   const auto command = k4a_color_control_command_t(e->command);
@@ -967,12 +1204,26 @@ k4a_color_resolution_t color_resolution_for(int height)
   return K4A_COLOR_RESOLUTION_3072P;
 }
 
-/// NFOV unbinned (640x576) unless a smaller depth was asked for; WFOV binned is
-/// the wide-angle equivalent at the same cost.
+/**
+ * @brief The depth mode an open starts in.
+ *
+ * Only the starting point: depth/mode picks any of the five explicitly, and
+ * the host replays it before the first start. A size that is exactly one
+ * mode's (k4atypes.h:292-297) selects it; otherwise NFOV unbinned (640x576)
+ * unless a smaller depth was asked for.
+ */
 k4a_depth_mode_t depth_mode_for(int width, int height)
 {
   if(width <= 0 && height <= 0)
     return K4A_DEPTH_MODE_NFOV_UNBINNED;
+  if(width == 320 && height == 288)
+    return K4A_DEPTH_MODE_NFOV_2X2BINNED;
+  if(width == 640 && height == 576)
+    return K4A_DEPTH_MODE_NFOV_UNBINNED;
+  if(width == 512 && height == 512)
+    return K4A_DEPTH_MODE_WFOV_2X2BINNED;
+  if(width == 1024 && height == 1024)
+    return K4A_DEPTH_MODE_WFOV_UNBINNED;
   if(width <= 320 || height <= 288)
     return K4A_DEPTH_MODE_NFOV_2X2BINNED;
   if(width >= 1024 || height >= 1024)
@@ -1055,7 +1306,20 @@ depthcam_device* backend_open(const char* uri, const depthcam_open_config* confi
     return nullptr;
   }
   dev->index = index;
-  remember_open(index, serial_of(dev->dev));
+  dev->serial = serial_of(dev->dev);
+  remember_open(index, dev->serial);
+
+  k4a_hardware_version_t v{};
+  if(g_k4a.device_get_version(dev->dev, &v) == K4A_RESULT_SUCCEEDED)
+  {
+    const auto ver = [](const k4a_version_t& x) {
+      return std::to_string(x.major) + "." + std::to_string(x.minor) + "."
+             + std::to_string(x.iteration);
+    };
+    // k4a_hardware_version_t, k4atypes.h: one version per firmware component.
+    dev->firmware = "rgb " + ver(v.rgb) + ", depth " + ver(v.depth) + ", depth sensor "
+                    + ver(v.depth_sensor) + ", audio " + ver(v.audio);
+  }
 
   dev->want_imu = (config->streams & DEPTHCAM_STREAM_IMU) != 0;
 
@@ -1089,6 +1353,9 @@ depthcam_device* backend_open(const char* uri, const depthcam_open_config* confi
   // Without this the colour and depth images of one capture can be milliseconds
   // apart, which shows up as fringing on a coloured point cloud.
   k4acfg.synchronized_images_only = need_color && need_depth;
+  clamp_fps(k4acfg);
+  dev->k4acfg = k4acfg;
+  dev->depth_mode_request = k4acfg.depth_mode;
 
   if(g_k4a.device_get_calibration(
          dev->dev, k4acfg.depth_mode, k4acfg.color_resolution, &dev->calibration)
@@ -1141,6 +1408,10 @@ int backend_start(depthcam_device* dev, depthcam_frame_cb on_frame, void* user)
   if(dev->running.load(std::memory_order_acquire))
     return 1;
 
+  // Before the thread exists, so the calibration and the cached images can be
+  // replaced without racing it.
+  dev->applyDepthMode();
+
   dev->on_frame = on_frame;
   dev->user = user;
   dev->running.store(true, std::memory_order_release);
@@ -1185,6 +1456,264 @@ void backend_stop(depthcam_device* dev)
     dev->thread.join();
 }
 
+/// Map a delivered stream to the k4a camera whose frame of reference it is in;
+/// called with calib_lock held.
+/// Depth and IR are the same camera; the cloud moves to colour under
+/// DEPTH_TO_COLOR (see emitPointCloud), the depth and IR images never do.
+std::optional<k4a_calibration_type_t> camera_of(const depthcam_device& dev, uint32_t stream)
+{
+  switch(stream)
+  {
+    case DEPTHCAM_STREAM_DEPTH:
+    case DEPTHCAM_STREAM_IR:
+      if(dev.k4acfg.depth_mode == K4A_DEPTH_MODE_OFF)
+        return std::nullopt;
+      return K4A_CALIBRATION_TYPE_DEPTH;
+    case DEPTHCAM_STREAM_POINTCLOUD:
+      if(dev.k4acfg.depth_mode == K4A_DEPTH_MODE_OFF)
+        return std::nullopt;
+      return dev.cloud_at_color ? K4A_CALIBRATION_TYPE_COLOR : K4A_CALIBRATION_TYPE_DEPTH;
+    case DEPTHCAM_STREAM_COLOR:
+      if(dev.k4acfg.color_resolution == K4A_COLOR_RESOLUTION_OFF)
+        return std::nullopt;
+      return K4A_CALIBRATION_TYPE_COLOR;
+    case DEPTHCAM_STREAM_IMU:
+      return K4A_CALIBRATION_TYPE_ACCEL;
+    default:
+      return std::nullopt;
+  }
+}
+
+int backend_get_intrinsics(depthcam_device* dev, uint32_t stream, depthcam_intrinsics* out)
+{
+  if(!dev || !out || !(dev->cfg.streams & stream))
+    return 0;
+  std::lock_guard l{dev->calib_lock};
+  const auto cam = camera_of(*dev, stream);
+  if(!cam || (*cam != K4A_CALIBRATION_TYPE_DEPTH && *cam != K4A_CALIBRATION_TYPE_COLOR))
+    return 0;
+
+  const k4a_calibration_camera_t& c = *cam == K4A_CALIBRATION_TYPE_COLOR
+                                          ? dev->calibration.color_camera_calibration
+                                          : dev->calibration.depth_camera_calibration;
+  if(c.resolution_width <= 0 || c.resolution_height <= 0)
+    return 0;
+
+  // The calibration is read for the mode in use ("may be different for each
+  // operating depth_mode and color_resolution", k4a.h:1598-1600) and carries
+  // the resolution it describes; should that not be the delivered size, the
+  // host scales it, and get_ray_table declines.
+  const auto& p = c.intrinsics.parameters.param;
+  depthcam_intrinsics r{};
+  r.struct_size = out->struct_size;
+  r.width = c.resolution_width;
+  r.height = c.resolution_height;
+  r.fx = p.fx;
+  r.fy = p.fy;
+  // The headers do not say where k4a puts a pixel's centre; they call the model
+  // "compatible with OpenCV" (k4atypes.h:1013-1014), whose centres are at
+  // integer coordinates, so cx, cy are passed through unshifted. get_ray_table
+  // asks the SDK itself with the same convention.
+  r.cx = p.cx;
+  r.cy = p.cy;
+
+  // k4a_calibration_intrinsic_parameters_t (k4atypes.h:1024-1046) names every
+  // coefficient, in the order cx cy fx fy k1..k6 codx cody p2 p1: note p2
+  // before p1. k4..k6 are OpenCV's rational denominator, which is what
+  // DEPTHCAM_DISTORTION_BROWN_CONRADY's k4..k6 are.
+  switch(c.intrinsics.type)
+  {
+    case K4A_CALIBRATION_LENS_DISTORTION_MODEL_BROWN_CONRADY:
+    // Early internal devices only (k4atypes.h:688); the same polynomial about a
+    // centre of distortion (codx, cody) that is dropped here. The ray table
+    // still comes from the SDK, so the positions stay exact.
+    case K4A_CALIBRATION_LENS_DISTORTION_MODEL_RATIONAL_6KT:
+      r.model = DEPTHCAM_DISTORTION_BROWN_CONRADY;
+      r.coeffs[0] = p.k1;
+      r.coeffs[1] = p.k2;
+      r.coeffs[2] = p.k3;
+      r.coeffs[3] = p.k4;
+      r.coeffs[4] = p.k5;
+      r.coeffs[5] = p.k6;
+      r.coeffs[6] = p.p1;
+      r.coeffs[7] = p.p2;
+      break;
+    default:
+      // THETA and POLYNOMIAL_3K are "Deprecated (not supported)" (k4atypes.h:684-687).
+      r.model = DEPTHCAM_DISTORTION_NONE;
+      break;
+  }
+  std::memcpy(out, &r, std::min<size_t>(out->struct_size, sizeof(r)));
+  return 1;
+}
+
+int backend_get_extrinsics(
+    depthcam_device* dev, uint32_t from, uint32_t to, depthcam_extrinsics* out)
+{
+  if(!dev || !out)
+    return 0;
+  std::lock_guard l{dev->calib_lock};
+  const auto a = camera_of(*dev, from);
+  const auto b = camera_of(*dev, to);
+  if(!a || !b)
+    return 0;
+
+  depthcam_extrinsics r{};
+  r.struct_size = out->struct_size;
+  r.rotation[0] = r.rotation[4] = r.rotation[8] = 1.f;
+  if(*a != *b)
+  {
+    // "use the parameters stored under extrinsics[source][target]"
+    // (k4atypes.h:1105-1111): row-major rotation, translation in millimetres
+    // (k4atypes.h:1003-1004).
+    const auto& x = dev->calibration.extrinsics[*a][*b];
+    std::memcpy(r.rotation, x.rotation, sizeof(r.rotation));
+    for(int i = 0; i < 3; i++)
+      r.translation[i] = x.translation[i] * 0.001f;
+  }
+  std::memcpy(out, &r, std::min<size_t>(out->struct_size, sizeof(r)));
+  return 1;
+}
+
+int backend_get_details(depthcam_device* dev, depthcam_device_details* out)
+{
+  if(!dev || !out)
+    return 0;
+  depthcam_device_details r{};
+  r.struct_size = out->struct_size;
+  r.model = "Azure Kinect DK";
+  r.serial = dev->serial.c_str();
+  r.firmware = dev->firmware.c_str();
+  // libk4a reports firmware versions only, no board revision.
+  r.hardware_rev = "";
+  {
+    std::lock_guard l{dev->calib_lock};
+    const auto [lo, hi] = depth_range_of(dev->k4acfg.depth_mode);
+    r.depth_min_m = lo;
+    r.depth_max_m = hi;
+  }
+  std::memcpy(out, &r, std::min<size_t>(out->struct_size, sizeof(r)));
+  return 1;
+}
+
+int backend_get_ray_table(
+    depthcam_device* dev, uint32_t stream, float* xy, int32_t w, int32_t h)
+{
+  // The delivered depth image is always the depth camera's: alignment here
+  // only moves the point cloud.
+  if(!dev || !xy || stream != DEPTHCAM_STREAM_DEPTH || !g_k4a.calibration_2d_to_3d)
+    return 0;
+
+  std::lock_guard l{dev->calib_lock};
+  if(dev->k4acfg.depth_mode == K4A_DEPTH_MODE_OFF)
+    return 0;
+  const auto& c = dev->calibration.depth_camera_calibration;
+  if(w != c.resolution_width || h != c.resolution_height || w <= 0 || h <= 0)
+    return 0;
+
+  // One per depth mode: the calibration only changes with it.
+  const size_t n = size_t(w) * size_t(h) * 2;
+  if(dev->rays_mode != int(dev->k4acfg.depth_mode) || dev->rays.size() != n)
+  {
+    try
+    {
+      dev->rays.resize(n);
+    }
+    catch(...)
+    {
+      return 0;
+    }
+    constexpr float nan = std::numeric_limits<float>::quiet_NaN();
+    for(int v = 0; v < h; v++)
+      for(int u = 0; u < w; u++)
+      {
+        // At 1000 mm the point is the ray scaled by z; "valid" is 0 outside
+        // the calibration's domain (k4a.h:1777-1785).
+        const k4a_float2_t px{{float(u), float(v)}};
+        k4a_float3_t p{};
+        int valid = 0;
+        const bool ok
+            = g_k4a.calibration_2d_to_3d(
+                  &dev->calibration, &px, 1000.f, K4A_CALIBRATION_TYPE_DEPTH,
+                  K4A_CALIBRATION_TYPE_DEPTH, &p, &valid)
+                  == K4A_RESULT_SUCCEEDED
+              && valid && p.xyz.z > 0.f;
+        float* o = dev->rays.data() + 2 * (size_t(v) * w + u);
+        o[0] = ok ? p.xyz.x / p.xyz.z : nan;
+        o[1] = ok ? p.xyz.y / p.xyz.z : nan;
+      }
+    dev->rays_mode = int(dev->k4acfg.depth_mode);
+  }
+  std::memcpy(xy, dev->rays.data(), n * sizeof(float));
+  return 1;
+}
+
+int backend_list_profiles(const char*, uint32_t stream, depthcam_profile_cb cb, void* user)
+{
+  if(!cb)
+    return 0;
+  const auto emit = [&](int w, int h, int fps, int fmt) {
+    depthcam_profile p{};
+    p.struct_size = sizeof(p);
+    p.width = w;
+    p.height = h;
+    p.fps = fps;
+    p.format = fmt;
+    cb(&p, user);
+  };
+
+  // libk4a fixes the modes: the resolutions are those of k4atypes.h:292-297
+  // and :311-317, the rates k4a_fps_t's (:480-482), limited to 15 fps where
+  // the hardware specification says so (see clamp_fps).
+  struct Mode
+  {
+    int w, h, max_fps;
+  };
+  switch(stream)
+  {
+    case DEPTHCAM_STREAM_DEPTH:
+    case DEPTHCAM_STREAM_POINTCLOUD:
+    case DEPTHCAM_STREAM_IR: {
+      const bool ir = stream == DEPTHCAM_STREAM_IR;
+      std::vector<Mode> modes{{320, 288, 30}, {640, 576, 30}, {512, 512, 30}, {1024, 1024, 15}};
+      // Passive IR has no depth, and runs at the full rate.
+      if(ir)
+        modes.push_back({1024, 1024, 30});
+      std::vector<std::array<int, 3>> seen;
+      for(const auto& m : modes)
+        for(int fps : {5, 15, 30})
+        {
+          const std::array<int, 3> key{m.w, m.h, fps};
+          if(fps > m.max_fps || std::find(seen.begin(), seen.end(), key) != seen.end())
+            continue;
+          seen.push_back(key);
+          // DEPTH16 and IR16 (k4atypes.h:398,413).
+          emit(m.w, m.h, fps, DEPTHCAM_FMT_GRAY16);
+        }
+      return 1;
+    }
+    case DEPTHCAM_STREAM_COLOR: {
+      const Mode modes[]{{1280, 720, 30},  {1920, 1080, 30}, {2560, 1440, 30},
+                         {2048, 1536, 30}, {3840, 2160, 30}, {4096, 3072, 15}};
+      for(const auto& m : modes)
+        for(int fps : {5, 15, 30})
+          if(fps <= m.max_fps)
+            // MJPEG as open() asks for it; BGRA32 at the same modes when a
+            // coloured cloud is wanted.
+            emit(m.w, m.h, fps, DEPTHCAM_FMT_MJPEG);
+      return 1;
+    }
+    default:
+      return 0;
+  }
+}
+
+void backend_set_stream_demand(depthcam_device* dev, uint32_t streams)
+{
+  if(dev)
+    dev->demand.store(streams, std::memory_order_release);
+}
+
 uint32_t backend_active_streams(depthcam_device* dev)
 {
   if(!dev)
@@ -1215,6 +1744,15 @@ const depthcam_backend_v1 g_backend{
     .get_control = &backend_get_control,
     .set_control = &backend_set_control,
     .active_streams = &backend_active_streams,
+    .get_intrinsics = &backend_get_intrinsics,
+    .get_extrinsics = &backend_get_extrinsics,
+    .get_details = &backend_get_details,
+    .get_ray_table = &backend_get_ray_table,
+    .list_controls2 = &backend_list_controls2,
+    // libk4a reports no setting changing.
+    .set_control_changed_callback = nullptr,
+    .list_profiles = &backend_list_profiles,
+    .set_stream_demand = &backend_set_stream_demand,
 };
 
 } // namespace
