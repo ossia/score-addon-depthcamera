@@ -30,7 +30,13 @@ class BackendRegistry
 public:
   struct Backend
   {
+    /// The host's own copy of the backend's table, at this build's ABI. A
+    /// backend built against an older header has a shorter struct; the copy has
+    /// every member it lacks set to null, so the rest of the plug-in tests a
+    /// pointer instead of an ABI version. Never the backend's own pointer.
     const depthcam_backend_v1* api{};
+    std::shared_ptr<const depthcam_backend_v1> table;
+    uint32_t abi_version{};
     QString name;         ///< api->name, cached as a QString for comparisons
     QString display_name;
     QString path;         ///< the library it came from
@@ -41,6 +47,20 @@ public:
   };
 
   static BackendRegistry& instance();
+
+  /**
+   * @brief Copies what a backend of @p api->abi_version provides into a full
+   * table of this build's ABI, nulling everything that version does not have.
+   *
+   * Reads exactly as many bytes as that version's struct has, never more.
+   * Null if the version is outside [DEPTHCAM_ABI_VERSION_MIN,
+   * DEPTHCAM_ABI_VERSION].
+   */
+  static std::shared_ptr<const depthcam_backend_v1>
+  adoptTable(const depthcam_backend_v1* api) noexcept;
+
+  /// Bytes in the depthcam_backend_v1 of a given ABI version; 0 if unknown.
+  static std::size_t tableSize(uint32_t abi_version) noexcept;
 
   /// Discover and initialise everything on the search path. Idempotent.
   void load();
