@@ -974,3 +974,8 @@ if(_backends)
 else()
   message(WARNING "score-addon-orbbec: no camera backend will be built")
 endif()
+
+### --- Synthetic camera -------------------------------------------------------
+### No SDK: a known scene with known calibration, for the tests. Built beside the
+### package, never into it; see Synthetic/Synthetic.cmake.
+include("${CMAKE_CURRENT_LIST_DIR}/Synthetic/Synthetic.cmake")
