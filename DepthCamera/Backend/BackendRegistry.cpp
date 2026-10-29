@@ -9,6 +9,8 @@
 #include <QSettings>
 
 #include <algorithm>
+#include <cstddef>
+#include <cstring>
 
 #if defined(_WIN32)
 #include <windows.h>
@@ -62,6 +64,37 @@ constexpr auto backend_glob = "score_depthcam_*.so";
 /// need.
 constexpr auto package_name = "depth-camera";
 
+}
+
+std::size_t BackendRegistry::tableSize(uint32_t abi_version) noexcept
+{
+  switch(abi_version)
+  {
+    case 3:
+      return offsetof(depthcam_backend_v1, get_intrinsics);
+    case 4:
+      return sizeof(depthcam_backend_v1);
+    default:
+      return 0;
+  }
+}
+
+std::shared_ptr<const depthcam_backend_v1>
+BackendRegistry::adoptTable(const depthcam_backend_v1* api) noexcept
+{
+  if(!api)
+    return {};
+  const auto version = api->abi_version;
+  if(version < DEPTHCAM_ABI_VERSION_MIN || version > DEPTHCAM_ABI_VERSION)
+    return {};
+  const std::size_t n = tableSize(version);
+  if(n == 0)
+    return {};
+
+  auto table = std::make_shared<depthcam_backend_v1>();
+  std::memset(table.get(), 0, sizeof(depthcam_backend_v1));
+  std::memcpy(table.get(), api, n);
+  return table;
 }
 
 BackendRegistry::BackendRegistry() = default;
@@ -178,16 +211,23 @@ void BackendRegistry::load()
       if(!api)
         continue;
 
-      if(api->abi_version != DEPTHCAM_ABI_VERSION)
+      // Older backends are accepted: the struct only ever grows, and the copy
+      // fills in what they predate. A newer one is not -- it may rely on the
+      // host reading members this build does not know about.
+      auto table = adoptTable(api);
+      if(!table)
       {
         qDebug() << "[depthcam]" << full << "speaks ABI" << api->abi_version
-                 << "but this build expects" << DEPTHCAM_ABI_VERSION
-                 << "- skipping";
+                 << "but this build accepts" << DEPTHCAM_ABI_VERSION_MIN << "to"
+                 << DEPTHCAM_ABI_VERSION << "- skipping";
         continue;
       }
+      api = table.get();
 
       Backend b;
       b.api = api;
+      b.table = std::move(table);
+      b.abi_version = api->abi_version;
       b.name = QString::fromUtf8(api->name ? api->name : "");
       b.display_name
           = QString::fromUtf8(api->display_name ? api->display_name : api->name);
@@ -215,7 +255,8 @@ void BackendRegistry::load()
         b.hotplug = true;
       }
 
-      qDebug() << "[depthcam] loaded backend" << b.name << "from" << full;
+      qDebug() << "[depthcam] loaded backend" << b.name << "(ABI" << b.abi_version
+               << ") from" << full;
 
       // A backend can initialise successfully and still be unusable -- the k4a
       // one stays registered when libk4a is absent so the browser can explain
