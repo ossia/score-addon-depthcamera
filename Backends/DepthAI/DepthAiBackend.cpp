@@ -1151,24 +1151,21 @@ int backend_init([[maybe_unused]] const char* resource_dir)
   {
 #if defined(_WIN32)
     /*
-     * depthai-core.dll is delay-loaded (see Backends/CMakeLists.txt) purely so
-     * that this can run first: the process search order does not include the
-     * directory this module came from, so the DLL sitting right beside it is
-     * not found. LOAD_WITH_ALTERED_SEARCH_PATH covers the whole chain in one
-     * call -- depthai's Windows triplet keeps libusb dynamic, and that DLL is
-     * in the same directory.
+     * depthai-core is linked into this module, but the libusb it talks to the
+     * camera through is a DLL -- depthai's Windows triplet keeps it dynamic --
+     * and the process search order does not include the directory this module
+     * came from. libusb-1.0.dll is delay-loaded (see Backends/CMakeLists.txt)
+     * purely so that this can load it by full path first.
      */
     if(resource_dir && *resource_dir)
     {
-      const std::string dll = std::string{resource_dir} + "\\depthai-core.dll";
-      if(!GetModuleHandleA("depthai-core.dll")
+      const std::string dll = std::string{resource_dir} + "\\libusb-1.0.dll";
+      if(!GetModuleHandleA("libusb-1.0.dll")
          && !LoadLibraryExA(dll.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH))
       {
         set_error(
-            "could not load depthai-core.dll from the package directory (error "
-            + std::to_string(GetLastError())
-            + "). It is built against the Visual C++ runtime, so that "
-              "redistributable has to be installed.");
+            "could not load libusb-1.0.dll from the package directory (error "
+            + std::to_string(GetLastError()) + ")");
         return 0;
       }
     }

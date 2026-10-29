@@ -57,16 +57,17 @@ depth-camera/
   score_depthcam_k4a.so           Azure Kinect DK
   score_depthcam_realsense.so     Intel RealSense
   score_depthcam_oak.so           Oak3DVision Oak CDK / QCDK
-  score_depthcam_depthai.so       Luxonis OAK
+  score_depthcam_depthai.so       Luxonis OAK: depthai-core and its device
+                                  firmware are linked into it
   extensions/                     OrbbecSDK runtime blobs, loaded by path
   libpointcloud.so                the Oak SDK, which ships as a binary
   oak/plugin/, oak/conf/          its camera plug-ins and model descriptions
-  libdepthai-core.so              the Luxonis SDK, with the device firmware in it
+  libusb-1.0.so                   the libusb depthai-core talks to the camera through
   udev/                           the Linux rules, see below
 ```
 
-The whole thing is about 65 MB installed, roughly half of which is the Luxonis
-SDK with the MyriadX and RVC4 device firmware compiled into it. One package
+The whole thing is about 65 MB installed, roughly a third of which is the
+Luxonis backend with the MyriadX and RVC4 device firmware compiled into it. One package
 rather than one per SDK: plugging in a camera should not require working out
 which of seven downloads yours is in.
 
@@ -265,8 +266,8 @@ is skipped with a message rather than failing the build.
 **On Windows with MSVC it needs the Visual C++ redistributable**, alone in this
 package.
 depthai's vcpkg triplet builds against the dynamic CRT, so the backend has to
-match it — `std::shared_ptr`s allocated inside `depthai-core.dll` are released
-here, and two CRTs would free them against the wrong heap. If it is missing, the
+match it — everything vcpkg builds for it is compiled `/MD`, and depthai-core is
+linked into the backend, so a static CRT would not link against it. If it is missing, the
 backend says so in the log instead of quietly not appearing.
 
 ### USB 3 is required for several cameras

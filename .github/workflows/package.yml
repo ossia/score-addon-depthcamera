@@ -152,6 +152,22 @@ jobs:
           Deployment/CheckPackage.sh \
             build/depth-camera-stage/depth-camera "${{ matrix.config.expect }}"
 
+      # depthai-core is linked into its backend statically, with a dependency
+      # closure resolved at build time: load the staged module and enumerate,
+      # so a library missing from that link or from the package fails here
+      # rather than on a user's machine. No camera on the runner; zero devices
+      # is the expected answer.
+      - name: Load the DepthAI backend
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            macOS)   ext=dylib ;;
+            Windows) ext=dll ;;
+            *)       ext=so ;;
+          esac
+          cmake --build build --target depthcam-probe
+          build/depthcam-probe "build/depth-camera-stage/depth-camera/score_depthcam_depthai.$ext"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v7
         with:
