@@ -16,6 +16,8 @@
 #include <DepthCamera/DepthCameraProtocol.hpp>
 #include <DepthCamera/DepthCameraStream.hpp>
 
+#include <Explorer/DocumentPlugin/DeviceDocumentPlugin.hpp>
+#include <Explorer/Explorer/DeviceExplorerModel.hpp>
 #include <State/Widgets/AddressFragmentLineEdit.hpp>
 
 #include <wobjectimpl.h>
@@ -154,8 +156,22 @@ bool InputDevice::reconnect()
     if(!proto->stream || !proto->stream->valid())
       return false;
 
+    // What the user writes to the camera goes into the device's settings, and
+    // so into the document; the next open replays it. Both copies: the
+    // document saves the explorer's.
+    auto onStore = [this](const ControlTree::ControlValues& values) {
+      auto s = m_settings.deviceSpecificSettings.value<DepthCameraSettings>();
+      if(s.controls == values)
+        return;
+      s.controls = values;
+      m_settings.deviceSpecificSettings = QVariant::fromValue(s);
+      if(auto* plug = m_ctx.findPlugin<Explorer::DeviceDocumentPlugin>())
+        plug->explorer().updateDevice(m_settings.name, m_settings);
+    };
+
     m_dev = std::make_unique<depthcam_device_impl>(
-        set, plug->exec, std::move(proto), this->settings().name.toStdString());
+        set, plug->exec, std::move(proto), this->settings().name.toStdString(),
+        std::move(onStore));
   }
   catch(const std::exception& e)
   {
@@ -417,6 +433,22 @@ InputSettingsWidget::InputSettingsWidget(QWidget* parent)
                      {&m_pointcloud, &m_colorPointcloud, &m_imu},
                      {"Point cloud", "Colored", "Accel / gyro"}));
 
+  // What the depth texture holds. Metres keeps the sensor's precision; the
+  // preview is the 0-4.5 m grey that documents from before this setting show.
+  m_depthOutput = new QComboBox{this};
+  m_depthOutput->addItem(
+      tr("Metres (32-bit float)"), int(DepthCameraSettings::DepthOutput::Metres));
+  m_depthOutput->addItem(
+      tr("Preview (grey, 0 to 4.5 m)"), int(DepthCameraSettings::DepthOutput::Preview));
+  checkForChanges(m_depthOutput);
+  layout->addRow(tr("Depth output"), m_depthOutput);
+
+  // Computed on the GPU from the depth stream: no CPU point cloud involved.
+  layout->addRow(
+      tr("GPU geometry"),
+      checkRow(
+          {&m_positions, &m_normals, &m_mesh}, {"Positions", "Normals", "Mesh"}));
+
   // Alignment decides the point cloud's resolution, which dominates its cost:
   // on a Femto Mega, depth-to-colour is 2.07M points per frame against 369k the
   // other way. Which trade-off is right depends on the piece.
@@ -465,7 +497,8 @@ InputSettingsWidget::InputSettingsWidget(QWidget* parent)
   layout->addRow(tr("Infrared"), formatRow(&m_irWidth, &m_irHeight, &m_irFps));
   layout->addRow(tr("Depth"), formatRow(&m_depthWidth, &m_depthHeight, &m_depthFps));
 
-  for(auto* cb : {m_rgb, m_ir, m_depth, m_pointcloud, m_colorPointcloud, m_imu})
+  for(auto* cb : {m_rgb, m_ir, m_depth, m_pointcloud, m_colorPointcloud, m_imu,
+                  m_positions, m_normals, m_mesh})
   {
     checkForChanges(cb);
     connect(cb, &QCheckBox::toggled, this, [this] { updateEnabledState(); });
@@ -518,6 +551,8 @@ void InputSettingsWidget::updateEnabledState()
   // A coloured cloud needs depth and colour in one frame of reference; without
   // an alignment a backend would be asked to read mismatched buffers.
   const bool can_color = m_pointcloud->isChecked() && aligned;
+
+  m_depthOutput->setEnabled(m_depth->isChecked());
   m_colorPointcloud->setEnabled(can_color);
 
   // Uncheck, not just disable: a disabled QCheckBox keeps its checked state and
@@ -533,7 +568,9 @@ Device::DeviceSettings InputSettingsWidget::getSettings() const
   s.name = m_deviceNameEdit->text();
   s.protocol = InputFactory::static_concreteKey();
 
-  DepthCameraSettings set;
+  // Start from what was loaded: the control values a device restores are not
+  // edited here, and a fresh struct would silently drop them.
+  DepthCameraSettings set = m_settings.deviceSpecificSettings.value<DepthCameraSettings>();
   set.device = currentAddress();
   set.rgb = m_rgb->isChecked();
   set.ir = m_ir->isChecked();
@@ -552,6 +589,11 @@ Device::DeviceSettings InputSettingsWidget::getSettings() const
   set.irWidth = m_irWidth->value();
   set.irHeight = m_irHeight->value();
   set.irFps = m_irFps->value();
+  set.depthOutput = static_cast<DepthCameraSettings::DepthOutput>(
+      m_depthOutput->currentData().toInt());
+  set.positions = m_positions->isChecked();
+  set.normals = m_normals->isChecked();
+  set.mesh = m_mesh->isChecked();
 
   s.deviceSpecificSettings = QVariant::fromValue(set);
   return s;
@@ -631,6 +673,11 @@ void InputSettingsWidget::setSettings(const Device::DeviceSettings& settings)
   m_irWidth->setValue(set.irWidth);
   m_irHeight->setValue(set.irHeight);
   m_irFps->setValue(set.irFps);
+  if(const int idx = m_depthOutput->findData(int(set.depthOutput)); idx >= 0)
+    m_depthOutput->setCurrentIndex(idx);
+  m_positions->setChecked(set.positions);
+  m_normals->setChecked(set.normals);
+  m_mesh->setChecked(set.mesh);
 
   updateEnabledState();
 }

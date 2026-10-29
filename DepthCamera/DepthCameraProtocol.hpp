@@ -15,59 +15,69 @@
 #include <ossia/network/generic/generic_node.hpp>
 
 #include <DepthCamera/DepthCameraControls.hpp>
+#include <DepthCamera/DepthCameraGpu.hpp>
 #include <DepthCamera/DepthCameraImu.hpp>
+#include <DepthCamera/DepthCameraInfo.hpp>
 #include <DepthCamera/DepthCameraStream.hpp>
 #include <DepthCamera/DepthCameraSettings.hpp>
 
 namespace Gfx::DepthCamera
 {
 
+/**
+ * @brief A graphics node owned by the device rather than by a parameter.
+ *
+ * One node can feed several parameters -- depth, positions, normals and mesh
+ * are four outlets of the same node, which uploads and processes each frame
+ * once for all of them -- so it is registered once and unregistered when the
+ * last parameter pointing at it goes.
+ */
+struct registered_node
+{
+  registered_node(GfxExecutionAction& ctx, std::unique_ptr<score::gfx::Node> n);
+  ~registered_node();
+  registered_node(const registered_node&) = delete;
+  registered_node& operator=(const registered_node&) = delete;
+
+  GfxExecutionAction* context{};
+  score::gfx::Node* node{};
+  int32_t id{};
+};
+
 class depthcam_parameter : public ossia::gfx::texture_parameter
 {
-  GfxExecutionAction* context{};
-
 public:
-  std::shared_ptr<InputStreamExtractor> decoder;
-  int32_t node_id{};
-  score::gfx::CameraNode* node{};
-
   depthcam_parameter(
-      const std::shared_ptr<InputStreamExtractor>& dec, ossia::net::node_base& n,
-      GfxExecutionAction& ctx);
+      std::shared_ptr<registered_node> node, int outlet, ossia::net::node_base& n);
   ~depthcam_parameter() override;
 
   void pull_texture(port_index idx) override;
+
+  const std::shared_ptr<registered_node> node;
+  const int outlet{};
 };
 
-class depthcam_pcl_parameter : public ossia::gfx::geometry_parameter
+class depthcam_geometry_parameter : public ossia::gfx::geometry_parameter
 {
-  GfxExecutionAction* context{};
-
 public:
-  std::shared_ptr<InputStreamExtractor> decoder;
-  int32_t node_id{};
-  score::gfx::Node* node{};
-
-  depthcam_pcl_parameter(
-      const std::shared_ptr<InputStreamExtractor>& dec, ossia::net::node_base& n,
-      GfxExecutionAction& ctx);
-  ~depthcam_pcl_parameter() override;
+  depthcam_geometry_parameter(
+      std::shared_ptr<registered_node> node, int outlet, ossia::net::node_base& n);
+  ~depthcam_geometry_parameter() override;
 
   void pull_geometry(port_index idx) override;
+
+  const std::shared_ptr<registered_node> node;
+  const int outlet{};
 };
 
 class depthcam_node : public ossia::net::node_base
 {
 public:
-  enum class Kind
-  {
-    Texture,
-    PointCloud
-  };
+  using parameter_factory
+      = std::function<std::unique_ptr<ossia::net::parameter_base>(ossia::net::node_base&)>;
 
   depthcam_node(
-      const std::shared_ptr<InputStreamExtractor>& dec, Kind kind,
-      GfxExecutionAction& ctx, ossia::net::device_base& dev, std::string name);
+      ossia::net::device_base& dev, std::string name, const parameter_factory& make);
 
   ossia::net::parameter_base* get_parameter() const override
   {
@@ -142,7 +152,8 @@ class depthcam_device_impl : public ossia::net::generic_device
 public:
   depthcam_device_impl(
       const DepthCameraSettings& settings, GfxExecutionAction& ctx,
-      std::unique_ptr<depthcam_protocol> proto, std::string name);
+      std::unique_ptr<depthcam_protocol> proto, std::string name,
+      ControlTree::StoreCallback onStore = {});
   ~depthcam_device_impl();
 
   /// Drops the settings and IMU trees.
@@ -153,9 +164,17 @@ public:
   /// a good margin on a reconnect or a device removal.
   void releaseControls() noexcept;
 
+  const std::shared_ptr<RenderParams>& renderParams() const noexcept { return m_params; }
+  const std::shared_ptr<Calibration>& calibration() const noexcept { return m_calib; }
+  ControlTree* controls() const noexcept { return m_controls.get(); }
+  InfoTree* info() const noexcept { return m_info.get(); }
+
 private:
+  std::shared_ptr<RenderParams> m_params;
+  std::shared_ptr<Calibration> m_calib;
   std::unique_ptr<ControlTree> m_controls;
   std::unique_ptr<ImuTree> m_imu;
+  std::unique_ptr<InfoTree> m_info;
 };
 
 }

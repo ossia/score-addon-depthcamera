@@ -76,6 +76,10 @@ private:
   QCheckBox* m_colorPointcloud{};
   QCheckBox* m_imu{};
   QComboBox* m_align{};
+  QComboBox* m_depthOutput{};
+  QCheckBox* m_positions{};
+  QCheckBox* m_normals{};
+  QCheckBox* m_mesh{};
 
   QSpinBox* m_colorWidth{};
   QSpinBox* m_colorHeight{};
