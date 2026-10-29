@@ -50,6 +50,10 @@ public:
 private:
   void updateEnabledState();
 
+  /// Fills the mode lists from the backend's list_profiles, for the camera the
+  /// address names. Empty, and hidden, for a backend that cannot say.
+  void refreshProfiles();
+
   /// The address the dialog will hand back: either what was typed, or the one
   /// composed from the network fields.
   QString currentAddress() const;
@@ -90,6 +94,12 @@ private:
   QSpinBox* m_irWidth{};
   QSpinBox* m_irHeight{};
   QSpinBox* m_irFps{};
+
+  /// "1280x720 @ 30 fps, RGB24": picking one fills the three spin boxes.
+  QComboBox* m_colorMode{};
+  QComboBox* m_irMode{};
+  QComboBox* m_depthMode{};
+  QString m_profilesFor;
 };
 
 }
