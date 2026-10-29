@@ -38,6 +38,7 @@
 
 #include <DepthCamera/DepthCameraCalibration.hpp>
 
+#include <QObject>
 #include <QString>
 
 #include <array>
@@ -114,6 +115,11 @@ private:
   std::array<StatsNodes, 4> m_stats{};
 
   float m_near{}, m_far{};
+
+  /// For reading the calibration again from the Qt thread once frames flow:
+  /// some SDKs only know it then (libfreenect2 reads it at start, DepthAI's
+  /// depth is rectified to a size chosen while streaming).
+  QObject m_context;
 };
 
 /// The projection calibration/<s>/projection publishes; column-major.
