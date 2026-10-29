@@ -166,7 +166,16 @@ jobs:
             *)       ext=so ;;
           esac
           cmake --build build --target depthcam-probe
-          build/depthcam-probe "build/depth-camera-stage/depth-camera/score_depthcam_depthai.$ext"
+          mod="build/depth-camera-stage/depth-camera/score_depthcam_depthai.$ext"
+          if ! build/depthcam-probe "$mod"; then
+            # What the module imports, for the error 126 / missing-library case.
+            case "$RUNNER_OS" in
+              macOS)   otool -L "$mod" ;;
+              Windows) dumpbin //dependents "$mod" ;;
+              *)       ldd "$mod" ;;
+            esac
+            exit 1
+          fi
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
