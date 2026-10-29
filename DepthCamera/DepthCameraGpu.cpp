@@ -17,6 +17,7 @@ namespace Gfx::DepthCamera
 {
 namespace
 {
+std::atomic<uint64_t> g_uploaded{0};
 
 // --- shaders ----------------------------------------------------------------
 //
@@ -644,7 +645,7 @@ public:
         reinterpret_cast<const char*>(f.data[0]), qsizetype(stride) * f.height));
     sub.setDataStride(quint32(stride));
     res.uploadTexture(m_raw, QRhiTextureUploadEntry{0, 0, sub});
-    m_uploadedBytes += uint64_t(stride) * uint64_t(f.height);
+    g_uploaded.fetch_add(uint64_t(stride) * uint64_t(f.height), std::memory_order_relaxed);
     return true;
   }
 
@@ -790,6 +791,7 @@ public:
     }
     res.uploadTexture(
         m_rays, QRhiTextureUploadEntry{0, 0, QRhiTextureSubresourceUploadDescription{rgba}});
+    g_uploaded.fetch_add(uint64_t(rgba.size()), std::memory_order_relaxed);
     m_calibration = model().calib->get();
     m_geometryDirty = true;
   }
@@ -1181,11 +1183,13 @@ private:
   QShader m_shMesh;
 
   ossia::small_vector<EdgePass, 4> m_edges;
-
-public:
-  uint64_t m_uploadedBytes{};
 };
 
+}
+
+uint64_t depthStreamUploadedBytes() noexcept
+{
+  return g_uploaded.load(std::memory_order_relaxed);
 }
 
 DepthStreamNode::DepthStreamNode(

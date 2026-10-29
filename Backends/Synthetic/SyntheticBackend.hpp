@@ -49,7 +49,16 @@ struct Counters
   std::atomic<int64_t> set_control_calls{};
   std::atomic<int64_t> starts{};
   std::atomic<int64_t> stops{};
+
+  /// CPU time of the camera thread, in nanoseconds: inside the host's frame
+  /// callback (what the host costs per frame on that thread), and computing
+  /// the CPU point cloud (what an SDK spends on one).
+  std::atomic<int64_t> host_callback_ns{};
+  std::atomic<int64_t> pointcloud_ns{};
 };
+
+/// CPU time consumed by the calling thread, in nanoseconds.
+int64_t threadCpuNs() noexcept;
 Counters& counters();
 
 /// With clock=manual: produce @p n frames on the device's thread and return

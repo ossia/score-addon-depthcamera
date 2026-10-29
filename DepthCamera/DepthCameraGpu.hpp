@@ -69,6 +69,10 @@ struct RenderParams
   std::atomic<int> topology{0}; ///< 0 triangles, 1 points
 };
 
+/// Bytes the depth and infrared renderers have handed to QRhi for upload, since
+/// start. For measuring.
+uint64_t depthStreamUploadedBytes() noexcept;
+
 class DepthStreamNode final : public score::gfx::ProcessNode
 {
 public:
