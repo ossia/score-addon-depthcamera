@@ -90,7 +90,7 @@ the one configuration that runs.
 
 **Most of what a sanitizer reports here belongs to the vendored SDKs.** Filter
 by path before reading anything into it: `librealsense`, `libjpeg`, `libusb`,
-`libfreenect`, `libfreenect2`, `libpointcloud`, `libdepthai-core`, and
+`libfreenect`, `libfreenect2`, `libpointcloud`, depthai-core (inside `score_depthcam_depthai`), and
 libstdc++ itself under
 `-fsanitize=integer` (which flags the `0 - 1` in every `std::string` and
 `std::vector` internal, where unsigned wraparound is defined and intended). A

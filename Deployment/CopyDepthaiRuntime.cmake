@@ -1,8 +1,9 @@
-### Copies depthai-core's installed shared libraries next to the backend.
+### Copies the shared libraries depthai-core installs next to the backend.
 ###
-### Globbed rather than named: what depthai installs beside libdepthai-core
-### depends on how it was configured, and naming them would silently ship a
-### package missing one. Run from POST_BUILD, since the install tree does not
+### depthai-core itself is static and inside the backend; what is left is what
+### its vcpkg triplets keep dynamic -- libusb today. Globbed rather than named:
+### that depends on how depthai was configured, and naming them would silently
+### ship a package missing one. Run from POST_BUILD, since the install tree does not
 ### exist at configure time.
 ###
 ###   cmake -DIN=<depthai install lib dirs> -DOUT=<package dir> -P CopyDepthaiRuntime.cmake
@@ -22,6 +23,9 @@ foreach(dir ${IN})
     "${dir}/*.so" "${dir}/*.so.*"
     "${dir}/*.dylib"
     "${dir}/*.dll")
+  # A libdepthai-core here is left over from a shared build in the same tree;
+  # nothing loads it any more.
+  list(FILTER _found EXCLUDE REGEX "depthai-core[^/]*$")
   list(APPEND _libs ${_found})
 endforeach()
 

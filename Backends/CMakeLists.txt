@@ -855,15 +855,18 @@ elseif(SCORE_DEPTHCAM_BUILD_DEPTHAI
   set(_dai_prefix "${CMAKE_BINARY_DIR}/depthai")
   set(_dai_install "${_dai_prefix}/install")
 
-  # On Windows the import library and the DLL land in different directories
-  # (LIBDIR and BINDIR), and the dynamic dependencies -- libusb, which the
-  # Windows triplet keeps shared -- sit beside the DLL. Both are searched.
-  if(APPLE)
-    set(_dai_lib "${_dai_install}/lib/libdepthai-core.dylib")
-  elseif(WIN32)
-    set(_dai_lib "${_dai_install}/lib/depthai-core.lib")
+  # depthai-core is built static and linked into the backend; see
+  # DepthAI/LinkInterface.cmake for why, and for how its dependency closure is
+  # resolved. The runtime directories are still swept for what stays shared:
+  # libusb, which every depthai triplet keeps dynamic. On Windows the DLL is
+  # installed to bin/.
+  set(_dai_link_dir "${_dai_prefix}/link")
+  set(_dai_link_rsp "${_dai_link_dir}/depthai-link.rsp")
+  set(_dai_link_cpp "${_dai_link_dir}/depthai-link.cpp")
+  if(MSVC)
+    set(_dai_archive "${_dai_prefix}/build/depthai-core.lib")
   else()
-    set(_dai_lib "${_dai_install}/lib/libdepthai-core.so")
+    set(_dai_archive "${_dai_prefix}/build/libdepthai-core.a")
   endif()
   set(_dai_runtime_dirs "${_dai_install}/lib")
   if(WIN32)
@@ -911,7 +914,9 @@ elseif(SCORE_DEPTHCAM_BUILD_DEPTHAI
     UPDATE_COMMAND ""
     CMAKE_ARGS
       ${_dai_cmake_args}
-      -DBUILD_SHARED_LIBS=ON
+      -DBUILD_SHARED_LIBS=OFF
+      "-DCMAKE_PROJECT_depthai_INCLUDE=${CMAKE_CURRENT_LIST_DIR}/DepthAI/LinkInterface.cmake"
+      "-DSCORE_DAI_LINK_DIR=${_dai_link_dir}"
       -DDEPTHAI_INSTALL=ON
       # Everything optional off: none of OpenCV, protobuf, curl, mp4v2,
       # AprilTag, PCL or the Foxglove bridge is reachable through
@@ -932,40 +937,63 @@ elseif(SCORE_DEPTHCAM_BUILD_DEPTHAI
       -DDEPTHAI_ENABLE_KOMPUTE=OFF
       -DDEPTHAI_ENABLE_BACKWARD=OFF
       -DDEPTHAI_DYNAMIC_CALIBRATION_SUPPORT=OFF
-    BUILD_BYPRODUCTS "${_dai_lib}"
+    BUILD_BYPRODUCTS "${_dai_archive}" "${_dai_link_rsp}" "${_dai_link_cpp}"
     USES_TERMINAL_CONFIGURE ON
     USES_TERMINAL_BUILD ON
     USES_TERMINAL_INSTALL ON
   )
+  # The link list is written by depthai's configure; rerun it when the script
+  # that writes it changes.
+  ExternalProject_Add_StepDependencies(depthai_core_ext configure
+    "${CMAKE_CURRENT_LIST_DIR}/DepthAI/LinkInterface.cmake")
 
   add_library(score_depthcam_depthai MODULE DepthAI/DepthAiBackend.cpp)
   add_dependencies(score_depthcam_depthai depthai_core_ext)
   target_include_directories(score_depthcam_depthai SYSTEM PRIVATE
     "${_dai_install}/include")
-  target_link_libraries(score_depthcam_depthai PRIVATE "${_dai_lib}")
+  # What depthai-core's static link interface says consumers define.
+  target_compile_definitions(score_depthcam_depthai PRIVATE MCAP_STATIC)
+
+  find_package(Threads REQUIRED)
+  target_link_libraries(score_depthcam_depthai PRIVATE Threads::Threads)
+  set_property(TARGET score_depthcam_depthai APPEND PROPERTY
+    LINK_DEPENDS "${_dai_archive}" "${_dai_link_rsp}")
+  if(MSVC)
+    # The libraries as #pragma comment(lib): link.exe takes them in any order,
+    # and a response file of our own would have to nest inside Ninja's.
+    set_source_files_properties("${_dai_link_cpp}" PROPERTIES GENERATED ON)
+    target_sources(score_depthcam_depthai PRIVATE "${_dai_link_cpp}")
+  elseif(APPLE)
+    # Driver-level; ld64 does not care where archives sit on the command line.
+    target_link_options(score_depthcam_depthai PRIVATE "@${_dai_link_rsp}")
+  else()
+    # ld-level and after the objects, where an ELF linker needs archives.
+    target_link_libraries(score_depthcam_depthai PRIVATE "-Wl,@${_dai_link_rsp}")
+  endif()
 
   # MSVC, not WIN32: cl/link-only flags, and under msys2 /DELAYLOAD would be
   # handed to ld as a source file and `delayimp` does not exist. A mingw build
   # relies on the package directory being on the search path instead.
   if(MSVC)
-    # The dynamic CRT, as for the Oak backend: depthai's Windows triplet sets
-    # VCPKG_CRT_LINKAGE dynamic, and every frame is a std::shared_ptr allocated
-    # in the DLL and released here, so two CRTs would free against the wrong
-    # heap. The redistributable is a requirement of this backend.
+    # The dynamic CRT: depthai's Windows triplet sets VCPKG_CRT_LINKAGE
+    # dynamic, so everything linked in here was compiled /MD, and a static CRT
+    # would not link against it. The redistributable is a requirement of this
+    # backend.
     set_property(TARGET score_depthcam_depthai PROPERTY
       MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
 
-    # Delay-load so backend_init() can load the DLL by full path first; one
-    # LOAD_WITH_ALTERED_SEARCH_PATH covers the chain, libusb-1.0.dll included.
-    target_link_options(score_depthcam_depthai PRIVATE "/DELAYLOAD:depthai-core.dll")
+    # Delay-load so backend_init() can load libusb by full path first: the
+    # process search order does not include the directory this module came
+    # from, and the triplet keeps libusb a DLL.
+    target_link_options(score_depthcam_depthai PRIVATE "/DELAYLOAD:libusb-1.0.dll")
     target_link_libraries(score_depthcam_depthai PRIVATE delayimp)
   endif()
 
   score_depthcam_setup_backend(score_depthcam_depthai)
   score_depthcam_install_udev_rules("${CMAKE_CURRENT_LIST_DIR}/DepthAI/udev")
 
-  # libdepthai-core and the libusb it links, beside the backend where $ORIGIN
-  # and @loader_path find them. See Deployment/CopyDepthaiRuntime.cmake.
+  # The libusb depthai links, beside the backend where $ORIGIN and
+  # @loader_path find it. See Deployment/CopyDepthaiRuntime.cmake.
   add_custom_command(TARGET score_depthcam_depthai POST_BUILD
     COMMAND ${CMAKE_COMMAND}
             "-DIN=${_dai_runtime_dirs}"
@@ -990,6 +1018,21 @@ if(_backends)
   message(STATUS "score-addon-orbbec: backends -> ${_backends}")
 else()
   message(WARNING "score-addon-orbbec: no camera backend will be built")
+endif()
+
+### Loads one backend module and runs init / enumerate / shutdown on it; the
+### Package workflow runs it on what it is about to ship. Beside the build tree
+### rather than in the backend directory, so it never ends up in the package.
+add_executable(depthcam-probe "${CMAKE_CURRENT_LIST_DIR}/../Tests/abi/probe.cpp")
+target_include_directories(depthcam-probe PRIVATE
+  "${CMAKE_CURRENT_LIST_DIR}/../DepthCamera/Backend")
+target_link_libraries(depthcam-probe PRIVATE ${CMAKE_DL_LIBS})
+set_target_properties(depthcam-probe PROPERTIES
+  CXX_STANDARD 20
+  CXX_STANDARD_REQUIRED ON
+  RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+if(MSVC)
+  set_property(TARGET depthcam-probe PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreadedDLL")
 endif()
 
 ### --- Synthetic camera -------------------------------------------------------

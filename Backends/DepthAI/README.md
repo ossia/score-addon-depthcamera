@@ -67,8 +67,18 @@ What that costs, and it is worth knowing:
   from a pinned submodule; this one cannot.
 - **About 30 MB in the package**, most of it that embedded firmware.
 
-The result is two files beside the backend — `libdepthai-core` and the libusb it
-links — found through `$ORIGIN` / `@loader_path` like everything else here.
+depthai-core is built **static** and linked into the backend, which exports
+`score_depthcam_backend_v1` and nothing else like every other one. As a shared
+library it would have to export its whole API: it has no export macros, and on
+Windows `CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS` on a library that size overflows the
+PE export table (`LNK1189: library limit of 65535 objects exceeded`). The
+archive's dependency closure — spdlog, fmt, yaml-cpp, libarchive, lz4, XLink,
+the CMakeRC firmware library — is resolved inside depthai's own configure by
+`LinkInterface.cmake` and handed to the backend's link as a generated list,
+since the package config depthai installs does not find those again.
+
+What is left beside the backend is the libusb every depthai triplet keeps
+dynamic, found through `$ORIGIN` / `@loader_path` like everything else here.
 
 ## Telemetry is turned off
 
@@ -130,19 +140,16 @@ Windows-with-MSVC needs three things the Unix builds do not, all of them the
 same plumbing the Oak backend next door already uses:
 
 - **the dynamic CRT.** depthai's Windows triplet sets `VCPKG_CRT_LINKAGE
-  dynamic`, so `depthai-core.dll` imports `MSVCP140`. This backend is therefore
-  built `/MD`, unlike the rest of the package, and needs the Visual C++
-  redistributable — `getAllAvailableDevices()` returns a `std::vector` we
-  destroy, and every frame is a `std::shared_ptr` allocated there and released
-  here, so two CRTs would free them against the wrong heap.
-- **a delay-load.** `depthai-core.dll` sits beside the backend, where Windows
-  does not look for a module's imports. `/DELAYLOAD:depthai-core.dll` lets
-  `init()` load it by full path with `LOAD_WITH_ALTERED_SEARCH_PATH` first; one
-  call covers the whole chain, `libusb-1.0.dll` included, because they are all
-  in that directory.
+  dynamic`, so everything vcpkg builds for it, and depthai-core itself, is
+  compiled `/MD`. This backend, which links them in, is therefore built `/MD`
+  too, unlike the rest of the package, and needs the Visual C++
+  redistributable.
+- **a delay-load.** `libusb-1.0.dll` sits beside the backend, where Windows
+  does not look for a module's imports. `/DELAYLOAD:libusb-1.0.dll` lets
+  `init()` load it by full path with `LOAD_WITH_ALTERED_SEARCH_PATH` first.
 - **two install directories.** depthai installs RUNTIME to `bin/` and
-  ARCHIVE/LIBRARY to `lib/`, so the import library and the DLL are not in the
-  same place. `Deployment/CopyDepthaiRuntime.cmake` sweeps both.
+  ARCHIVE/LIBRARY to `lib/`, so libusb's DLL is not where its import library
+  is. `Deployment/CopyDepthaiRuntime.cmake` sweeps both.
 
 ## What was and was not verified
 
