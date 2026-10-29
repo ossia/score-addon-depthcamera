@@ -8,6 +8,7 @@
 
 #include <QDebug>
 
+#include <chrono>
 #include <utility>
 
 namespace Gfx::DepthCamera
@@ -116,7 +117,8 @@ InputStream::InputStream(
     cfg.streams |= DEPTHCAM_STREAM_COLOR;
   if(settings.ir)
     cfg.streams |= DEPTHCAM_STREAM_IR;
-  if(settings.depth)
+  // The GPU outputs are all computed from depth.
+  if(settings.depth || settings.positions || settings.normals || settings.mesh)
     cfg.streams |= DEPTHCAM_STREAM_DEPTH;
   if(settings.pointcloud)
     cfg.streams |= DEPTHCAM_STREAM_POINTCLOUD;
@@ -180,12 +182,51 @@ void InputStream::close() noexcept
   m_device = nullptr;
 }
 
+void InputStream::setStartGate(std::shared_future<void> gate) noexcept
+{
+  m_startGate = std::move(gate);
+}
+
+void InputStream::addConsumer(StreamOutput& out, int delta) noexcept
+{
+  const int before = out.consumers.fetch_add(delta, std::memory_order_acq_rel);
+  const int after = before + delta;
+  if((before > 0) != (after > 0))
+    pushDemand();
+}
+
+uint32_t InputStream::demand() const noexcept
+{
+  uint32_t d = DEPTHCAM_STREAM_IMU;
+  for(const StreamOutput* o : {&m_rgb, &m_depth, &m_ir, &m_pcl})
+    if(o->consumers.load(std::memory_order_acquire) > 0)
+      d |= o->stream;
+  return d;
+}
+
+void InputStream::pushDemand() noexcept
+{
+  if(m_device && m_backend && m_backend->set_stream_demand
+     && m_running.load(std::memory_order_acquire))
+    m_backend->set_stream_demand(m_device, demand());
+}
+
 bool InputStream::start() noexcept
 {
+  std::lock_guard lifecycle{m_lifecycle};
   if(!m_device || !m_backend || !m_backend->start)
     return false;
   if(m_running.load(std::memory_order_acquire))
     return true;
+
+  // The saved control values first; see setStartGate. Bounded, so a camera
+  // that hangs on a write cannot keep the document from running.
+  if(m_startGate.valid())
+  {
+    if(m_startGate.wait_for(std::chrono::seconds(10)) != std::future_status::ready)
+      qDebug() << "[depthcam] restoring the saved controls is taking long; starting anyway";
+    m_startGate = {};
+  }
 
   m_stopVotes.store(0, std::memory_order_relaxed);
   m_running.store(true, std::memory_order_release);
@@ -198,11 +239,21 @@ bool InputStream::start() noexcept
     m_running.store(false, std::memory_order_release);
     return false;
   }
+
+  for(StreamOutput* o : {&m_rgb, &m_depth, &m_ir, &m_pcl})
+  {
+    o->stats = {};
+    o->first_device_ns = 0;
+    o->first_host_ns = 0;
+    o->last_device_ns = 0;
+  }
+  pushDemand();
   return true;
 }
 
 void InputStream::stop() noexcept
 {
+  std::lock_guard lifecycle{m_lifecycle};
   if(!m_running.exchange(false, std::memory_order_acq_rel))
     return;
 
@@ -244,7 +295,10 @@ void InputStream::onFrame(const depthcam_frame& f)
       break;
     case DEPTHCAM_STREAM_DEPTH:
       if(f.depth_unit_mm > 0.f)
+      {
         depth_unit_mm.store(f.depth_unit_mm, std::memory_order_relaxed);
+        m_depth.unit_mm.store(f.depth_unit_mm, std::memory_order_relaxed);
+      }
       handleImage(m_depth, f);
       break;
     case DEPTHCAM_STREAM_POINTCLOUD:
@@ -265,6 +319,51 @@ void InputStream::setImuCallback(imu_callback cb) noexcept
 {
   std::lock_guard lock{m_imu_mutex};
   m_imu_cb = std::move(cb);
+}
+
+void InputStream::setStatsCallback(stats_callback cb) noexcept
+{
+  std::lock_guard lock{m_stats_mutex};
+  m_stats_cb = std::move(cb);
+}
+
+void InputStream::stamp(StreamOutput& out, const depthcam_frame& f, AVFrame* av) noexcept
+{
+  const int64_t host_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                              std::chrono::steady_clock::now().time_since_epoch())
+                              .count();
+  auto& st = out.stats;
+  if(st.frames == 0)
+  {
+    out.first_device_ns = f.timestamp_ns;
+    out.first_host_ns = host_ns;
+  }
+  else if(f.timestamp_ns > out.last_device_ns && out.last_device_ns > 0)
+  {
+    st.interval_ms = double(f.timestamp_ns - out.last_device_ns) * 1e-6;
+    // Smoothed over about ten frames: a frame rate, not a jitter meter.
+    const double inst = 1000. / st.interval_ms;
+    st.fps = st.fps > 0 ? st.fps + (inst - st.fps) * 0.1 : inst;
+    out.fps.store(st.fps, std::memory_order_relaxed);
+  }
+  st.frames++;
+  out.last_device_ns = f.timestamp_ns;
+  st.device_time_ms = f.timestamp_ns >= out.first_device_ns
+                          ? double(f.timestamp_ns - out.first_device_ns) * 1e-6
+                          : 0.;
+  st.host_time_ms = double(host_ns - out.first_host_ns) * 1e-6;
+
+  if(av)
+  {
+    // Capture time on the device clock, and arrival on the host's, carried by
+    // the frame through the graph.
+    av->pts = int64_t(f.timestamp_ns);
+    av->best_effort_timestamp = host_ns;
+  }
+
+  std::lock_guard lock{m_stats_mutex};
+  if(m_stats_cb)
+    m_stats_cb(out, st);
 }
 
 void InputStream::handleImu(const depthcam_frame& f)
@@ -291,12 +390,26 @@ void InputStream::handleImage(StreamOutput& out, const depthcam_frame& f)
 {
   // Every path below must either take ownership of the buffer or release it,
   // exactly once.
-  if(out.queue.size() >= max_queued_frames)
+
+  // Nothing is drawing it: give the buffer straight back. Queuing it would
+  // only pin a backend buffer until the queue overflowed.
+  if(out.consumers.load(std::memory_order_acquire) <= 0)
   {
+    stamp(out, f, nullptr);
     if(f.release)
       f.release(f.owner);
     return;
   }
+
+  if(out.queue.size() >= max_queued_frames)
+  {
+    out.stats.dropped++;
+    stamp(out, f, nullptr);
+    if(f.release)
+      f.release(f.owner);
+    return;
+  }
+  out.source_format.store(f.format, std::memory_order_relaxed);
 
   if(const auto codec = to_codec_id(f.format); codec != AV_CODEC_ID_NONE)
   {
@@ -308,6 +421,7 @@ void InputStream::handleImage(StreamOutput& out, const depthcam_frame& f)
       out.width.store(decoded->width, std::memory_order_relaxed);
       out.height.store(decoded->height, std::memory_order_relaxed);
       out.format.store(decoded->format, std::memory_order_relaxed);
+      stamp(out, f, decoded);
       out.queue.enqueue(decoded);
     }
     return;
@@ -346,13 +460,23 @@ void InputStream::handleImage(StreamOutput& out, const depthcam_frame& f)
   out.height.store(f.height, std::memory_order_relaxed);
   out.format.store(int(pixfmt), std::memory_order_relaxed);
 
+  stamp(out, f, frame.get());
   out.queue.enqueue(frame.release());
 }
 
 void InputStream::handlePointCloud(const depthcam_frame& f)
 {
+  if(m_pcl.consumers.load(std::memory_order_acquire) <= 0)
+  {
+    stamp(m_pcl, f, nullptr);
+    if(f.release)
+      f.release(f.owner);
+    return;
+  }
   if(m_pcl.queue.size() >= max_queued_pointclouds)
   {
+    m_pcl.stats.dropped++;
+    stamp(m_pcl, f, nullptr);
     if(f.release)
       f.release(f.owner);
     return;
@@ -386,6 +510,7 @@ void InputStream::handlePointCloud(const depthcam_frame& f)
     return;
   }
 
+  stamp(m_pcl, f, frame.get());
   m_pcl.queue.enqueue(frame.release());
 }
 
