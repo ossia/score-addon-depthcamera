@@ -33,10 +33,19 @@ int main(int argc, char** argv)
     dir = ".";
 
 #if defined(_WIN32)
-  HMODULE lib = LoadLibraryExA(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+  // As BackendRegistry (ossia::dylib_loader) does: plain LoadLibrary on an
+  // absolute path, so the module's own imports resolve through the process
+  // search order and nothing beside it is found for free.
+  char full[MAX_PATH * 4];
+  if(!GetFullPathNameA(path.c_str(), sizeof(full), full, nullptr))
+  {
+    std::fprintf(stderr, "GetFullPathName(%s) failed: %lu\n", path.c_str(), GetLastError());
+    return 1;
+  }
+  HMODULE lib = LoadLibraryA(full);
   if(!lib)
   {
-    std::fprintf(stderr, "LoadLibrary(%s) failed: %lu\n", path.c_str(), GetLastError());
+    std::fprintf(stderr, "LoadLibrary(%s) failed: %lu\n", full, GetLastError());
     return 1;
   }
   auto entry = reinterpret_cast<score_depthcam_backend_v1_fn>(
