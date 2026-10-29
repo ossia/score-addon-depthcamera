@@ -2,7 +2,7 @@
     "key": "efc2818e-89c0-4741-b949-6c7cd82a1257",
     "raw_name": "depth-camera",
     "name": "Depth cameras",
-    "version": 1,
+    "version": 2,
     "kind": "library",
     "short": "Backends for Orbbec, Kinect, Azure Kinect, Intel RealSense, Oak3DVision and Luxonis depth cameras",
     "long": "Camera SDKs for the Depth Camera Input device: Orbbec (Femto Mega/Bolt, Gemini, Astra, over USB and Ethernet), Kinect v1, Kinect v2, Azure Kinect DK, Intel RealSense, the Oak3DVision Oak CDK/QCDK time-of-flight modules and the Luxonis OAK range (OAK-D, OAK-1 and OAK-4, over USB and Ethernet). One shared object per SDK, each exporting a single symbol, so several camera families can be used in the same session.",
