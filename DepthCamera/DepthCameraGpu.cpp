@@ -26,12 +26,13 @@ std::atomic<uint64_t> g_uploaded{0};
 // interpolation anywhere, so a texel of an output is computed from exactly the
 // raw sample of the same pixel.
 //
-// Image pixel (u, v), v from the top, lives in row (flip ? H-1-v : v) of a
-// render target, flip being the backend's isYUpInFramebuffer(): that is how
-// score's render targets are laid out -- an ISF shader reading one through
-// IMG_TEXEL sees the same rows on every backend (isf_glsl_prelude.hpp) -- so
-// these textures sample like any other node's output. Uploaded textures (the
-// raw frame, the ray table) are in image order everywhere.
+// Image pixel (u, v), v from the top, lives in row H-1-v of a render target on
+// every backend but Vulkan, and in row v there. That is how score's render
+// targets are laid out: its ISF prelude reads them through the same
+// correction, applied on SPIR-V only (isf_glsl_prelude.hpp), and Metal reads
+// mirrored without it. These textures then sample like any other node's
+// output. Uploaded textures (the raw frame, the ray table) are in image order
+// everywhere.
 
 constexpr auto params_block = R"_(
 layout(std140, binding = 0) uniform Params {
@@ -335,7 +336,7 @@ public:
   void initState(score::gfx::RenderList& renderer, QRhiResourceUpdateBatch&) override
   {
     auto& rhi = *renderer.state.rhi;
-    m_flip = rhi.isYUpInFramebuffer();
+    m_flip = rhi.backend() != QRhi::Vulkan;
     m_compute = rhi.isFeatureSupported(QRhi::Compute);
 
     m_ubo = rhi.newBuffer(QRhiBuffer::Dynamic, QRhiBuffer::UniformBuffer, sizeof(ParamsUBO));
