@@ -58,3 +58,16 @@ if(FFMPEG_INCLUDE_DIRS)
   target_include_directories(score_addon_orbbec_gfx_test SYSTEM PRIVATE ${FFMPEG_INCLUDE_DIRS})
 endif()
 set_property(TEST score_addon_orbbec_gfx_test APPEND PROPERTY LABELS depthcam gpu)
+
+# The whole device inside score, on the synthetic module: no hidden sources,
+# the plug-in as the application loads it.
+score_add_test(score_addon_orbbec_device_test
+  SOURCES unit/DepthCameraDeviceTest.cpp
+  APP
+  PLUGINS score_addon_orbbec score_plugin_scenario score_plugin_deviceexplorer)
+target_include_directories(score_addon_orbbec_device_test PRIVATE "${_dc_root}"
+  "${SCORE_ROOT_SOURCE_DIR}/tests/fixtures")
+target_compile_definitions(score_addon_orbbec_device_test PRIVATE
+  SCORE_DEPTHCAM_TEST_BACKEND_DIR="${SCORE_DEPTHCAM_TEST_BACKEND_DIR}")
+add_dependencies(score_addon_orbbec_device_test score_depthcam_synthetic)
+set_tests_properties(score_addon_orbbec_device_test PROPERTIES LABELS "depthcam")
