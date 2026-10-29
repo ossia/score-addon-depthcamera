@@ -398,6 +398,10 @@ if(SCORE_DEPTHCAM_PERF OR (SCORE_TESTING AND COMMAND score_add_test))
   if(COMMAND setup_score_common_exe_features)
     setup_score_common_exe_features(depthcam_perf)
   endif()
+  # A static Qt needs its platform plug-ins linked in.
+  if(COMMAND enable_minimal_qt_plugins)
+    enable_minimal_qt_plugins(depthcam_perf 1)
+  endif()
   # A static build registers its plug-ins by linking all of them, once the
   # list is complete.
   if(SCORE_STATIC_PLUGINS OR NOT BUILD_SHARED_LIBS)
