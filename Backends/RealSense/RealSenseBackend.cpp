@@ -8,15 +8,21 @@
 #include <depthcam_abi.h>
 
 #include <librealsense2/rs.hpp>
+#include <librealsense2/rsutil.h>
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cmath>
 #include <cctype>
+#include <cstring>
+#include <limits>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace
@@ -190,18 +196,225 @@ std::string sensor_group(const std::string& name)
   return n.empty() ? "device" : n;
 }
 
-/// One option, plus the sensor it has to be addressed through.
+/// One option, plus the sensor or processing block it has to be addressed
+/// through.
 struct ControlEntry
 {
+  /// The owner of a sensor option. Empty for a filter's, whose block lives in
+  /// the device (see `filter`).
   rs2::sensor sensor;
+  /// Index into depthcam_device::filters, or -1 for a sensor option.
+  int filter{-1};
+  /// filters/<name>/enabled: ours, not an rs2_option.
+  bool is_enable{};
   rs2_option option{};
   std::string path;
   std::string name;
   std::string description;
+  std::string unit;
+  std::string auto_control;
+  uint32_t flags{};
   std::vector<std::string> labels;
   std::vector<const char*> label_ptrs;
-  depthcam_control desc{};
+  depthcam_control2 desc{};
 };
+
+/**
+ * @brief Where set_control_changed_callback's callback lives.
+ *
+ * Shared with the lambdas handed to librealsense rather than owned by the
+ * device: those run on librealsense's options-watcher thread, and nothing in
+ * rs_options.hpp says unsubscribing waits for a call already under way. The
+ * mutex is held across the call so that clearing returns only once no call is
+ * in flight, which is what the ABI promises the host.
+ */
+struct ChangeNotifier
+{
+  std::mutex lock;
+  depthcam_control_changed_cb cb{};
+  void* user{};
+
+  void emit(const char* id)
+  {
+    std::lock_guard l{lock};
+    if(cb)
+    {
+      try
+      {
+        cb(id, user);
+      }
+      catch(...)
+      {
+      }
+    }
+  }
+};
+
+/// One of librealsense's post-processing blocks, as filters/<name>/...
+struct FilterSlot
+{
+  const char* name;
+  rs2::filter* block;
+  std::atomic_bool enabled{false};
+};
+
+/**
+ * @brief Fill a ControlEntry's range, kind and labels from what the sensor or
+ * block says about one option.
+ *
+ * @param path_for builds the address once it is known whether the option is
+ *        read-only.
+ * @return false for an option that cannot be used.
+ */
+template<typename PathFor>
+bool describeOption(
+    ControlEntry& e, const rs2::options& opts, rs2_option opt, PathFor&& path_for)
+{
+  e.name = rs2_option_to_string(opt);
+
+  rs2::option_range range{};
+  bool read_only = false;
+  try
+  {
+    if(!opts.supports(opt))
+      return false;
+    range = opts.get_option_range(opt);
+    read_only = opts.is_option_read_only(opt);
+    if(const char* desc = opts.get_option_description(opt))
+      e.description = desc;
+  }
+  catch(...)
+  {
+    // An option the sensor lists but refuses to describe is not usable.
+    return false;
+  }
+
+  e.path = path_for(read_only);
+  if(read_only)
+    e.flags |= DEPTHCAM_CONTROL_VOLATILE;
+
+  auto& d = e.desc.base;
+  d.access = DEPTHCAM_ACCESS_READ | (read_only ? 0 : DEPTHCAM_ACCESS_WRITE);
+  d.min = range.min;
+  d.max = range.max;
+  d.step = range.step;
+  d.def = range.def;
+
+  // Every librealsense option is a float over the wire; the range is what
+  // says whether it is really a switch, a menu or a number.
+  const bool integral = range.step >= 1.f && range.min == std::floor(range.min)
+                        && range.max == std::floor(range.max);
+
+  // The visual preset is a menu whatever its span; it is the one that matters.
+  const bool menu_candidate
+      = integral
+        && ((range.max - range.min) <= 32.f
+            || (opt == RS2_OPTION_VISUAL_PRESET && (range.max - range.min) <= 256.f));
+
+  if(integral && range.min == 0.f && range.max == 1.f && range.step == 1.f)
+  {
+    d.kind = DEPTHCAM_CONTROL_BOOL;
+  }
+  else if(menu_candidate)
+  {
+    // Values with names are a menu. rs2_get_option_value_description returns
+    // null for anything that is just a number (rs_options.hpp: "or null if no
+    // special meaning"), so this only fires for the handful that really are
+    // enumerations (visual preset, sequence id).
+    bool named = false;
+    for(float v = range.min; v <= range.max; v += range.step)
+    {
+      const char* label = nullptr;
+      try
+      {
+        label = opts.get_option_value_description(opt, v);
+      }
+      catch(...)
+      {
+      }
+      e.labels.push_back(label ? label : std::to_string(int(v)));
+      named = named || (label != nullptr);
+    }
+    if(named)
+    {
+      d.kind = DEPTHCAM_CONTROL_ENUM;
+    }
+    else
+    {
+      e.labels.clear();
+      d.kind = DEPTHCAM_CONTROL_INT;
+    }
+  }
+  else
+  {
+    d.kind = integral ? DEPTHCAM_CONTROL_INT : DEPTHCAM_CONTROL_FLOAT;
+  }
+  return true;
+}
+
+/**
+ * @brief Units, flags and auto toggles of a sensor option, where the SDK says
+ * what they are.
+ *
+ * Only units librealsense states are given: rs_option.h documents the laser in
+ * mW, depth units in metres, the baseline and depth offset in millimetres and
+ * the auto-exposure limit in microseconds; the D400 depth exposure is
+ * registered as "Depth Exposure (usec)" (src/ds/d400/d400-device.cpp:779).
+ * The colour exposure and the temperatures are documented in no unit, so they
+ * get none.
+ */
+void describeSensorOption(ControlEntry& e, const std::string& group)
+{
+  switch(e.option)
+  {
+    case RS2_OPTION_LASER_POWER:
+      e.unit = "mW";
+      break;
+    case RS2_OPTION_DEPTH_UNITS:
+      e.unit = "m";
+      e.flags |= DEPTHCAM_CONTROL_ADVANCED;
+      break;
+    case RS2_OPTION_STEREO_BASELINE:
+    case RS2_OPTION_DEPTH_OFFSET:
+      e.unit = "mm";
+      break;
+    case RS2_OPTION_AUTO_EXPOSURE_LIMIT:
+      e.unit = "us";
+      break;
+    case RS2_OPTION_EXPOSURE:
+      if(group == "depth")
+        e.unit = "us";
+      [[fallthrough]];
+    case RS2_OPTION_GAIN:
+      // Both are driven by the sensor's auto exposure while it is on.
+      e.auto_control = group + "/" + option_slug(RS2_OPTION_ENABLE_AUTO_EXPOSURE);
+      e.flags |= DEPTHCAM_CONTROL_VOLATILE;
+      break;
+    case RS2_OPTION_WHITE_BALANCE:
+      e.auto_control = group + "/" + option_slug(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE);
+      e.flags |= DEPTHCAM_CONTROL_VOLATILE;
+      break;
+    case RS2_OPTION_FRAMES_QUEUE_SIZE:
+    case RS2_OPTION_ERROR_POLLING_ENABLED:
+    case RS2_OPTION_OUTPUT_TRIGGER_ENABLED:
+    case RS2_OPTION_AUTO_EXPOSURE_CONVERGE_STEP:
+    case RS2_OPTION_GLOBAL_TIME_ENABLED:
+    case RS2_OPTION_HOST_PERFORMANCE:
+    case RS2_OPTION_STREAM_FILTER:
+    case RS2_OPTION_STREAM_FORMAT_FILTER:
+    case RS2_OPTION_STREAM_INDEX_FILTER:
+    case RS2_OPTION_SEQUENCE_NAME:
+    case RS2_OPTION_SEQUENCE_SIZE:
+    case RS2_OPTION_SEQUENCE_ID:
+    case RS2_OPTION_EMITTER_ON_OFF:
+    case RS2_OPTION_THERMAL_COMPENSATION:
+    case RS2_OPTION_ENABLE_MOTION_CORRECTION:
+      e.flags |= DEPTHCAM_CONTROL_ADVANCED;
+      break;
+    default:
+      break;
+  }
+}
 
 } // namespace
 
@@ -236,6 +449,72 @@ struct depthcam_device
 
   void scanControls();
   ControlEntry* findControl(const char* id);
+  rs2::options& optionsOf(ControlEntry& e);
+
+  /// Post-processing, applied to depth in this order: the one
+  /// doc/post-processing-filters.md:106 recommends, which wraps spatial and
+  /// temporal in a depth -> disparity -> depth round trip on stereo cameras
+  /// ("Applicable for stereo-based depth cameras (D4XX)", :107).
+  rs2::decimation_filter decimation;
+  rs2::threshold_filter threshold;
+  rs2::spatial_filter spatial;
+  rs2::temporal_filter temporal;
+  rs2::hole_filling_filter hole_filling;
+  rs2::disparity_transform to_disparity{true};
+  rs2::disparity_transform from_disparity{false};
+  bool stereo{};
+  enum
+  {
+    FilterDecimation,
+    FilterThreshold,
+    FilterSpatial,
+    FilterTemporal,
+    FilterHoleFilling,
+  };
+  std::array<FilterSlot, 5> filters{{
+      {"decimation", &decimation},
+      {"threshold", &threshold},
+      {"spatial", &spatial},
+      {"temporal", &temporal},
+      {"hole_filling", &hole_filling},
+  }};
+  rs2::frameset filterDepth(const rs2::frameset& fs);
+
+  /// Which opened streams the host consumes; see set_stream_demand.
+  std::atomic<uint32_t> demand{~0u};
+
+  std::shared_ptr<ChangeNotifier> notifier{std::make_shared<ChangeNotifier>()};
+  bool subscribed{};
+  void subscribeOptions();
+
+  /// What the pipeline streams: resolved from the config at open, so that the
+  /// calibration can be read before start(), and replaced by the profile
+  /// start() actually got (which differs after a fallback).
+  std::mutex profile_lock;
+  rs2::pipeline_profile profile;
+  /// The intrinsics of the frames last delivered, which is what the ABI asks
+  /// for: rs2::align gives an aligned frame the target's intrinsics
+  /// (src/proc/align.cpp:197-200) and decimation shrinks depth. The profile
+  /// pointer is only compared, never dereferenced, so a profile that has since
+  /// gone away is harmless.
+  struct Delivered
+  {
+    const void* key{};
+    std::optional<rs2_intrinsics> intrinsics;
+  };
+  Delivered delivered_depth, delivered_color, delivered_ir;
+  void remember(Delivered& d, const rs2::frame& f);
+
+  std::optional<rs2_intrinsics> profileIntrinsics(rs2_stream s, int index);
+  std::optional<rs2_intrinsics> intrinsicsOf(uint32_t stream);
+  rs2::stream_profile frameOf(uint32_t stream);
+  bool alignedTo(rs2_stream target);
+
+  std::mutex ray_lock;
+  std::vector<float> rays;
+  rs2_intrinsics rays_for{};
+
+  std::string model, firmware;
 
   void handle(const rs2::frameset& fs);
   void handleMotion(const rs2::motion_frame& f);
@@ -468,91 +747,85 @@ void depthcam_device::scanControls()
       ControlEntry e;
       e.sensor = sensor;
       e.option = opt;
-      e.name = rs2_option_to_string(opt);
-
-      rs2::option_range range{};
-      bool read_only = false;
-      try
-      {
-        if(!sensor.supports(opt))
-          continue;
-        range = sensor.get_option_range(opt);
-        read_only = sensor.is_option_read_only(opt);
-        if(sensor.supports(opt))
-          e.description = sensor.get_option_description(opt);
-      }
-      catch(...)
-      {
-        // An option the sensor lists but refuses to describe is not usable.
-        continue;
-      }
-
       // Read-only options are temperatures, frame counters and the settings an
       // `auto` mode chose for itself: worth watching, never worth a slider next
       // to the ones that do something. The sensor name stays in the leaf there,
       // because two sensors each report their own temperature.
-      e.path = read_only ? "sensors/" + group + "_" + option_slug(opt)
-                         : group + "/" + option_slug(opt);
-
-      if(std::any_of(controls.begin(), controls.end(), [&](const ControlEntry& o) {
-           return o.path == e.path;
+      if(describeOption(e, sensor, opt, [&](bool read_only) {
+           return read_only ? "sensors/" + group + "_" + option_slug(opt)
+                            : group + "/" + option_slug(opt);
          }))
+      {
+        if(std::any_of(controls.begin(), controls.end(), [&](const ControlEntry& o) {
+             return o.path == e.path;
+           }))
+          continue;
+        describeSensorOption(e, group);
+        controls.push_back(std::move(e));
+      }
+    }
+  }
+
+  // The post-processing blocks, after the sensors so that the camera's own
+  // settings come first in the tree.
+  for(int i = 0; i < int(filters.size()); i++)
+  {
+    const std::string base = std::string{"filters/"} + filters[i].name + "/";
+
+    ControlEntry en;
+    en.filter = i;
+    en.is_enable = true;
+    en.path = base + "enabled";
+    en.name = std::string{filters[i].name} + " enabled";
+    en.description = "Apply librealsense's " + std::string{filters[i].name}
+                     + " filter to the depth stream and the point cloud";
+    en.flags = DEPTHCAM_CONTROL_FILTER;
+    en.desc.base.kind = DEPTHCAM_CONTROL_BOOL;
+    en.desc.base.access = DEPTHCAM_ACCESS_READ | DEPTHCAM_ACCESS_WRITE;
+    en.desc.base.min = 0;
+    en.desc.base.max = 1;
+    en.desc.base.step = 1;
+    en.desc.base.def = 0;
+    controls.push_back(std::move(en));
+
+    rs2::filter& block = *filters[i].block;
+    std::vector<rs2_option> options;
+    try
+    {
+      options = block.get_supported_options();
+    }
+    catch(...)
+    {
+      continue;
+    }
+    for(auto opt : options)
+    {
+      // Which stream a block processes is fixed by how it is used here.
+      if(opt == RS2_OPTION_STREAM_FILTER || opt == RS2_OPTION_STREAM_FORMAT_FILTER
+         || opt == RS2_OPTION_STREAM_INDEX_FILTER || opt == RS2_OPTION_FRAMES_QUEUE_SIZE)
         continue;
 
-      auto& d = e.desc;
-      d.access = DEPTHCAM_ACCESS_READ | (read_only ? 0 : DEPTHCAM_ACCESS_WRITE);
-      d.min = range.min;
-      d.max = range.max;
-      d.step = range.step;
-      d.def = range.def;
-
-      // Every librealsense option is a float over the wire; the range is what
-      // says whether it is really a switch, a menu or a number.
-      const bool integral = range.step >= 1.f
-                            && range.min == std::floor(range.min)
-                            && range.max == std::floor(range.max);
-
-      if(integral && range.min == 0.f && range.max == 1.f && range.step == 1.f)
-      {
-        d.kind = DEPTHCAM_CONTROL_BOOL;
-      }
-      else if(integral && (range.max - range.min) <= 32.f)
-      {
-        // Values with names are a menu. get_option_value_description returns
-        // null for anything that is just a number, so this only fires for the
-        // handful that really are enumerations (visual preset, sequence id).
-        bool named = false;
-        for(float v = range.min; v <= range.max; v += range.step)
-        {
-          const char* label = nullptr;
-          try
-          {
-            label = sensor.get_option_value_description(opt, v);
-          }
-          catch(...)
-          {
-          }
-          e.labels.push_back(label ? label : std::to_string(int(v)));
-          named = named || (label != nullptr);
-        }
-        if(named)
-        {
-          d.kind = DEPTHCAM_CONTROL_ENUM;
-        }
-        else
-        {
-          e.labels.clear();
-          d.kind = DEPTHCAM_CONTROL_INT;
-        }
-      }
-      else
-      {
-        d.kind = integral ? DEPTHCAM_CONTROL_INT : DEPTHCAM_CONTROL_FLOAT;
-      }
-
+      ControlEntry e;
+      e.filter = i;
+      e.option = opt;
+      if(!describeOption(e, block, opt, [&](bool) { return base + option_slug(opt); }))
+        continue;
+      e.flags |= DEPTHCAM_CONTROL_FILTER;
+      // "Min range in meters" / "Max range in meters", src/proc/threshold.cpp:22-24.
+      if(i == FilterThreshold
+         && (opt == RS2_OPTION_MIN_DISTANCE || opt == RS2_OPTION_MAX_DISTANCE))
+        e.unit = "m";
       controls.push_back(std::move(e));
     }
   }
+
+  // An auto toggle that this camera does not have cannot make anything inactive.
+  for(auto& e : controls)
+    if(!e.auto_control.empty() && !findControl(e.auto_control.c_str()))
+    {
+      e.auto_control.clear();
+      e.flags &= ~uint32_t(DEPTHCAM_CONTROL_VOLATILE);
+    }
 
   // Point the descriptors at their owner's stable storage, after the vector has
   // stopped reallocating.
@@ -563,12 +836,24 @@ void depthcam_device::scanControls()
     for(const auto& l : e.labels)
       e.label_ptrs.push_back(l.c_str());
 
-    e.desc.id = e.path.c_str();
-    e.desc.name = e.name.c_str();
-    e.desc.description = e.description.empty() ? nullptr : e.description.c_str();
-    e.desc.enum_labels = e.label_ptrs.empty() ? nullptr : e.label_ptrs.data();
-    e.desc.enum_count = int32_t(e.label_ptrs.size());
+    auto& d = e.desc;
+    d.struct_size = sizeof(depthcam_control2);
+    d.base.id = e.path.c_str();
+    d.base.name = e.name.c_str();
+    d.base.description = e.description.empty() ? nullptr : e.description.c_str();
+    d.base.enum_labels = e.label_ptrs.empty() ? nullptr : e.label_ptrs.data();
+    d.base.enum_count = int32_t(e.label_ptrs.size());
+    d.unit = e.unit.empty() ? nullptr : e.unit.c_str();
+    d.flags = e.flags;
+    d.auto_control = e.auto_control.empty() ? nullptr : e.auto_control.c_str();
   }
+}
+
+rs2::options& depthcam_device::optionsOf(ControlEntry& e)
+{
+  if(e.filter >= 0)
+    return *filters[e.filter].block;
+  return e.sensor;
 }
 
 ControlEntry* depthcam_device::findControl(const char* id)
@@ -623,31 +908,297 @@ void depthcam_device::handleMotion(const rs2::motion_frame& f)
   on_frame(&out, user);
 }
 
+rs2::frameset depthcam_device::filterDepth(const rs2::frameset& fs)
+{
+  const auto on = [this](int i) {
+    return filters[i].enabled.load(std::memory_order_relaxed);
+  };
+  if(!std::any_of(filters.begin(), filters.end(), [](const FilterSlot& f) {
+       return f.enabled.load(std::memory_order_relaxed);
+     }))
+    return fs;
+
+  try
+  {
+    // Each block takes the whole frameset and replaces only the depth frame in
+    // it (generic_processing_block::prepare_output,
+    // src/proc/synthetic-stream.cpp:113-170); decimation only touches Z16
+    // depth (src/proc/decimation-filter.cpp:217-218), so IR keeps its size.
+    rs2::frame f = fs;
+    if(on(FilterDecimation))
+      f = decimation.process(f);
+    if(on(FilterThreshold))
+      f = threshold.process(f);
+    const bool disparity = stereo && (on(FilterSpatial) || on(FilterTemporal));
+    if(disparity)
+      f = to_disparity.process(f);
+    if(on(FilterSpatial))
+      f = spatial.process(f);
+    if(on(FilterTemporal))
+      f = temporal.process(f);
+    if(disparity)
+      f = from_disparity.process(f);
+    if(on(FilterHoleFilling))
+      f = hole_filling.process(f);
+    if(auto out = f.as<rs2::frameset>())
+      return out;
+  }
+  catch(const std::exception& e)
+  {
+    set_error(std::string{"depth filters: "} + e.what());
+  }
+  return fs;
+}
+
+void depthcam_device::remember(Delivered& d, const rs2::frame& f)
+{
+  if(!f)
+    return;
+  const auto p = f.get_profile();
+  std::lock_guard l{profile_lock};
+  if(p.get() == d.key)
+    return;
+  std::optional<rs2_intrinsics> in;
+  if(auto vp = p.as<rs2::video_stream_profile>())
+    in = vp.get_intrinsics();
+  d.key = p.get();
+  d.intrinsics = in;
+}
+
 void depthcam_device::handle(const rs2::frameset& frames)
 {
   if(!running.load(std::memory_order_acquire))
     return;
 
+  const uint32_t want = cfg.streams & demand.load(std::memory_order_acquire);
+  const bool want_depth = want & (DEPTHCAM_STREAM_DEPTH | DEPTHCAM_STREAM_POINTCLOUD);
+
   rs2::frameset fs = frames;
+  if(want_depth)
+    fs = filterDepth(fs);
+
+  // Only what alignment changes: depth (and so the cloud) when aligning to
+  // colour, the other video streams when aligning to depth.
   if(align)
-    fs = align->process(fs);
+  {
+    const uint32_t aligned
+        = cfg.align == DEPTHCAM_ALIGN_DEPTH_TO_COLOR
+              ? uint32_t(DEPTHCAM_STREAM_DEPTH | DEPTHCAM_STREAM_POINTCLOUD)
+              : uint32_t(
+                    DEPTHCAM_STREAM_COLOR | DEPTHCAM_STREAM_IR
+                    | DEPTHCAM_STREAM_POINTCLOUD);
+    if(want & aligned)
+      fs = align->process(fs);
+  }
 
   // Each stream independently: a frameset without colour must still yield
   // depth, IR and the point cloud.
-  if(cfg.streams & DEPTHCAM_STREAM_COLOR)
+  if(want & DEPTHCAM_STREAM_COLOR)
     if(auto c = fs.get_color_frame())
+    {
+      remember(delivered_color, c);
       emitImage(DEPTHCAM_STREAM_COLOR, c, 0.f);
+    }
 
-  if(cfg.streams & DEPTHCAM_STREAM_IR)
+  if(want & DEPTHCAM_STREAM_IR)
     if(auto ir = fs.get_infrared_frame())
+    {
+      remember(delivered_ir, ir);
       emitImage(DEPTHCAM_STREAM_IR, ir, 0.f);
+    }
 
-  if(cfg.streams & DEPTHCAM_STREAM_DEPTH)
+  if(want_depth)
     if(auto d = fs.get_depth_frame())
-      emitImage(DEPTHCAM_STREAM_DEPTH, d, depth_scale_mm);
+    {
+      remember(delivered_depth, d);
+      if(want & DEPTHCAM_STREAM_DEPTH)
+        emitImage(DEPTHCAM_STREAM_DEPTH, d, depth_scale_mm);
+    }
 
-  if(cfg.streams & DEPTHCAM_STREAM_POINTCLOUD)
+  if(want & DEPTHCAM_STREAM_POINTCLOUD)
     emitPointCloud(fs);
+}
+
+bool depthcam_device::alignedTo(rs2_stream target)
+{
+  // An alignment whose target is not streamed does nothing.
+  if(!align)
+    return false;
+  if(target == RS2_STREAM_COLOR && cfg.align != DEPTHCAM_ALIGN_DEPTH_TO_COLOR)
+    return false;
+  if(target == RS2_STREAM_DEPTH && cfg.align != DEPTHCAM_ALIGN_COLOR_TO_DEPTH)
+    return false;
+  std::lock_guard l{profile_lock};
+  if(!profile)
+    return false;
+  try
+  {
+    return bool(profile.get_stream(target));
+  }
+  catch(...)
+  {
+    return false;
+  }
+}
+
+std::optional<rs2_intrinsics> depthcam_device::profileIntrinsics(rs2_stream s, int index)
+{
+  std::lock_guard l{profile_lock};
+  if(!profile)
+    return std::nullopt;
+  try
+  {
+    if(auto vp = profile.get_stream(s, index).as<rs2::video_stream_profile>())
+      return vp.get_intrinsics();
+  }
+  catch(...)
+  {
+  }
+  return std::nullopt;
+}
+
+std::optional<rs2_intrinsics> depthcam_device::intrinsicsOf(uint32_t stream)
+{
+  // What the frames said first; before any has arrived (the host reads the
+  // calibration right after open), what the pipeline will deliver, with the
+  // alignment applied the way rs2::align applies it. Decimation is not
+  // anticipated there: the host scales intrinsics to the delivered size.
+  const auto delivered = [this](const Delivered& d) {
+    std::lock_guard l{profile_lock};
+    return d.intrinsics;
+  };
+  switch(stream)
+  {
+    case DEPTHCAM_STREAM_DEPTH:
+    case DEPTHCAM_STREAM_POINTCLOUD:
+      if(auto in = delivered(delivered_depth))
+        return in;
+      return alignedTo(RS2_STREAM_COLOR) ? profileIntrinsics(RS2_STREAM_COLOR, -1)
+                                         : profileIntrinsics(RS2_STREAM_DEPTH, -1);
+    case DEPTHCAM_STREAM_COLOR:
+      if(auto in = delivered(delivered_color))
+        return in;
+      return alignedTo(RS2_STREAM_DEPTH) ? intrinsicsOf(DEPTHCAM_STREAM_DEPTH)
+                                         : profileIntrinsics(RS2_STREAM_COLOR, -1);
+    case DEPTHCAM_STREAM_IR:
+      if(auto in = delivered(delivered_ir))
+        return in;
+      return alignedTo(RS2_STREAM_DEPTH) ? intrinsicsOf(DEPTHCAM_STREAM_DEPTH)
+                                         : profileIntrinsics(RS2_STREAM_INFRARED, 1);
+    default:
+      return std::nullopt;
+  }
+}
+
+rs2::stream_profile depthcam_device::frameOf(uint32_t stream)
+{
+  // The physical sensor whose frame of reference a delivered stream is in: an
+  // aligned stream has moved into its target's.
+  rs2_stream type{};
+  int index = -1;
+  switch(stream)
+  {
+    case DEPTHCAM_STREAM_DEPTH:
+    case DEPTHCAM_STREAM_POINTCLOUD:
+      type = alignedTo(RS2_STREAM_COLOR) ? RS2_STREAM_COLOR : RS2_STREAM_DEPTH;
+      break;
+    case DEPTHCAM_STREAM_COLOR:
+      type = alignedTo(RS2_STREAM_DEPTH) ? RS2_STREAM_DEPTH : RS2_STREAM_COLOR;
+      break;
+    case DEPTHCAM_STREAM_IR:
+      type = alignedTo(RS2_STREAM_DEPTH) ? RS2_STREAM_DEPTH : RS2_STREAM_INFRARED;
+      index = type == RS2_STREAM_INFRARED ? 1 : -1;
+      break;
+    case DEPTHCAM_STREAM_IMU:
+      type = RS2_STREAM_ACCEL;
+      break;
+    default:
+      return {};
+  }
+  std::lock_guard l{profile_lock};
+  if(!profile)
+    return {};
+  try
+  {
+    return profile.get_stream(type, index);
+  }
+  catch(...)
+  {
+    return {};
+  }
+}
+
+void depthcam_device::subscribeOptions()
+{
+  // Collected under the control lock, subscribed outside it: subscribing
+  // starts librealsense's watcher thread, and a notification arriving on it
+  // must be free to call back into get_control.
+  //
+  // Grouped by the underlying rs2_options, not by handle: every ControlEntry
+  // holds its own rs2::sensor copy, and a second subscription on the same
+  // rs2_options replaces the first (src/rs.cpp:1602 assigns it).
+  struct Target
+  {
+    const void* key;
+    rs2::options* opts;
+    std::vector<std::pair<rs2_option, std::string>> ids;
+  };
+  std::vector<Target> targets;
+  {
+    std::lock_guard l{control_lock};
+    if(subscribed)
+      return;
+    subscribed = true;
+    scanControls();
+
+    for(auto& e : controls)
+    {
+      if(e.is_enable)
+        continue;
+      const void* key = e.filter >= 0 ? static_cast<const void*>(filters[e.filter].block)
+                                      : static_cast<const void*>(e.sensor.get().get());
+      auto it = std::find_if(targets.begin(), targets.end(), [&](const Target& t) {
+        return t.key == key;
+      });
+      if(it == targets.end())
+      {
+        targets.push_back({key, &optionsOf(e), {}});
+        it = targets.end() - 1;
+      }
+      it->ids.emplace_back(e.option, e.path);
+    }
+  }
+
+  for(auto& [key, opts, ids] : targets)
+  {
+    try
+    {
+      // rs_options.hpp:292. librealsense polls the options on a thread of its
+      // own (src/core/options-watcher.cpp:96-130) and reports what changed,
+      // whoever changed it. The subscription is held by the rs2_options it
+      // was made on (src/rs.cpp:1602), so it ends when the sensor handles in
+      // `controls` do. Processing blocks accept the call but never report:
+      // their options_container returns an empty subscription
+      // (src/core/options-container.h:72).
+      opts->on_options_changed(
+          [n = notifier, ids = std::move(ids)](const rs2::options_list& list) {
+        try
+        {
+          for(auto&& v : list)
+            for(const auto& [opt, path] : ids)
+              if(opt == v->id)
+                n->emit(path.c_str());
+        }
+        catch(...)
+        {
+        }
+      });
+    }
+    catch(const std::exception& ex)
+    {
+      set_error(std::string{"option notifications: "} + ex.what());
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -751,6 +1302,17 @@ int backend_list_controls(
   std::lock_guard lock{dev->control_lock};
   dev->scanControls();
   for(const auto& e : dev->controls)
+    cb(&e.desc.base, user);
+  return 1;
+}
+
+int backend_list_controls2(depthcam_device* dev, depthcam_control2_cb cb, void* user)
+{
+  if(!dev || !cb)
+    return 0;
+  std::lock_guard lock{dev->control_lock};
+  dev->scanControls();
+  for(const auto& e : dev->controls)
     cb(&e.desc, user);
   return 1;
 }
@@ -761,11 +1323,16 @@ int backend_get_control(depthcam_device* dev, const char* id, double* out)
     return 0;
   std::lock_guard lock{dev->control_lock};
   auto* e = dev->findControl(id);
-  if(!e || !(e->desc.access & DEPTHCAM_ACCESS_READ))
+  if(!e || !(e->desc.base.access & DEPTHCAM_ACCESS_READ))
     return 0;
+  if(e->is_enable)
+  {
+    *out = dev->filters[e->filter].enabled.load(std::memory_order_relaxed) ? 1. : 0.;
+    return 1;
+  }
   try
   {
-    *out = double(e->sensor.get_option(e->option));
+    *out = double(dev->optionsOf(*e).get_option(e->option));
     return 1;
   }
   catch(const std::exception& ex)
@@ -785,11 +1352,16 @@ int backend_set_control(depthcam_device* dev, const char* id, double value)
     return 0;
   std::lock_guard lock{dev->control_lock};
   auto* e = dev->findControl(id);
-  if(!e || !(e->desc.access & DEPTHCAM_ACCESS_WRITE))
+  if(!e || !(e->desc.base.access & DEPTHCAM_ACCESS_WRITE))
     return 0;
+  if(e->is_enable)
+  {
+    dev->filters[e->filter].enabled.store(value != 0., std::memory_order_relaxed);
+    return 1;
+  }
   try
   {
-    e->sensor.set_option(e->option, float(value));
+    dev->optionsOf(*e).set_option(e->option, float(value));
     return 1;
   }
   catch(const std::exception& ex)
@@ -804,6 +1376,324 @@ int backend_set_control(depthcam_device* dev, const char* id, double value)
   {
     return 0;
   }
+}
+
+void backend_set_control_changed_callback(
+    depthcam_device* dev, depthcam_control_changed_cb cb, void* user)
+{
+  if(!dev)
+    return;
+  {
+    // Waits for a notification in flight: see ChangeNotifier.
+    std::lock_guard l{dev->notifier->lock};
+    dev->notifier->cb = cb;
+    dev->notifier->user = user;
+  }
+  // Only once something listens: every subscription is a polling thread in
+  // librealsense.
+  if(cb)
+  {
+    try
+    {
+      dev->subscribeOptions();
+    }
+    catch(...)
+    {
+    }
+  }
+}
+
+/// k1 k2 k3 k4 k5 k6 p1 p2, from rs2_intrinsics.
+void fill_intrinsics(const rs2_intrinsics& in, depthcam_intrinsics* out)
+{
+  depthcam_intrinsics r{};
+  r.struct_size = out->struct_size;
+  r.width = in.width;
+  r.height = in.height;
+  r.fx = in.fx;
+  r.fy = in.fy;
+  // "pixel offset from the left edge" (h/rs_types.h:64-65), with the pixel
+  // centre convention the ABI already takes from librealsense's own
+  // deprojection: no shift.
+  r.cx = in.ppx;
+  r.cy = in.ppy;
+
+  // rs2_intrinsics::coeffs: "Order for Brown-Conrady: [k1, k2, p1, p2, k3].
+  // Order for F-Theta Fish-eye: [k1, k2, k3, k4, 0]" (h/rs_types.h:69);
+  // Kannala-Brandt reads coeffs[0..3] as k1..k4 (rs2_deproject_pixel_to_point,
+  // src/rs.cpp:4338-4350).
+  switch(in.model)
+  {
+    case RS2_DISTORTION_NONE:
+      r.model = DEPTHCAM_DISTORTION_NONE;
+      break;
+    case RS2_DISTORTION_MODIFIED_BROWN_CONRADY:
+    case RS2_DISTORTION_INVERSE_BROWN_CONRADY:
+    case RS2_DISTORTION_BROWN_CONRADY:
+      r.model = in.model == RS2_DISTORTION_BROWN_CONRADY
+                    ? DEPTHCAM_DISTORTION_BROWN_CONRADY
+                : in.model == RS2_DISTORTION_INVERSE_BROWN_CONRADY
+                    ? DEPTHCAM_DISTORTION_INVERSE_BROWN_CONRADY
+                    : DEPTHCAM_DISTORTION_MODIFIED_BROWN_CONRADY;
+      r.coeffs[0] = in.coeffs[0]; // k1
+      r.coeffs[1] = in.coeffs[1]; // k2
+      r.coeffs[2] = in.coeffs[4]; // k3
+      r.coeffs[6] = in.coeffs[2]; // p1
+      r.coeffs[7] = in.coeffs[3]; // p2
+      break;
+    case RS2_DISTORTION_KANNALA_BRANDT4:
+      r.model = DEPTHCAM_DISTORTION_KANNALA_BRANDT4;
+      for(int i = 0; i < 4; i++)
+        r.coeffs[i] = in.coeffs[i];
+      break;
+    case RS2_DISTORTION_FTHETA:
+      r.model = DEPTHCAM_DISTORTION_FTHETA;
+      r.coeffs[0] = in.coeffs[0];
+      break;
+    default:
+      r.model = DEPTHCAM_DISTORTION_NONE;
+      break;
+  }
+  std::memcpy(out, &r, std::min<size_t>(out->struct_size, sizeof(r)));
+}
+
+int backend_get_intrinsics(depthcam_device* dev, uint32_t stream, depthcam_intrinsics* out)
+{
+  if(!dev || !out || !(dev->cfg.streams & stream))
+    return 0;
+  try
+  {
+    const auto in = dev->intrinsicsOf(stream);
+    if(!in)
+      return 0;
+    fill_intrinsics(*in, out);
+    return 1;
+  }
+  catch(const std::exception& e)
+  {
+    set_error(e.what());
+    return 0;
+  }
+  catch(...)
+  {
+    return 0;
+  }
+}
+
+int backend_get_extrinsics(
+    depthcam_device* dev, uint32_t from, uint32_t to, depthcam_extrinsics* out)
+{
+  if(!dev || !out)
+    return 0;
+  try
+  {
+    depthcam_extrinsics r{};
+    r.struct_size = out->struct_size;
+    r.rotation[0] = r.rotation[4] = r.rotation[8] = 1.f;
+
+    const auto a = dev->frameOf(from);
+    const auto b = dev->frameOf(to);
+    if(!a || !b)
+      return 0;
+    // Same sensor -- also what an aligned stream and its target come to.
+    if(a.unique_id() != b.unique_id())
+    {
+      const rs2_extrinsics x = a.get_extrinsics_to(b);
+      // "Column-major 3x3 rotation matrix", "in meters" (h/rs_sensor.h:111-112).
+      for(int i = 0; i < 3; i++)
+        for(int j = 0; j < 3; j++)
+          r.rotation[3 * i + j] = x.rotation[3 * j + i];
+      for(int i = 0; i < 3; i++)
+        r.translation[i] = x.translation[i];
+    }
+    std::memcpy(out, &r, std::min<size_t>(out->struct_size, sizeof(r)));
+    return 1;
+  }
+  catch(const std::exception& e)
+  {
+    set_error(e.what());
+    return 0;
+  }
+  catch(...)
+  {
+    return 0;
+  }
+}
+
+int backend_get_details(depthcam_device* dev, depthcam_device_details* out)
+{
+  if(!dev || !out)
+    return 0;
+  depthcam_device_details r{};
+  r.struct_size = out->struct_size;
+  r.model = dev->model.c_str();
+  r.serial = dev->serial.c_str();
+  r.firmware = dev->firmware.c_str();
+  // rs2_camera_info has no hardware revision (h/rs_sensor.h:23-42), and no
+  // query gives the range of the current mode, which on a D400 depends on the
+  // resolution, the baseline and the scene.
+  r.hardware_rev = "";
+  r.depth_min_m = 0.f;
+  r.depth_max_m = 0.f;
+  std::memcpy(out, &r, std::min<size_t>(out->struct_size, sizeof(r)));
+  return 1;
+}
+
+int backend_get_ray_table(
+    depthcam_device* dev, uint32_t stream, float* xy, int32_t w, int32_t h)
+{
+  if(!dev || !xy || w <= 0 || h <= 0)
+    return 0;
+  if(stream != DEPTHCAM_STREAM_DEPTH && stream != DEPTHCAM_STREAM_POINTCLOUD)
+    return 0;
+  try
+  {
+    const auto in = dev->intrinsicsOf(DEPTHCAM_STREAM_DEPTH);
+    if(!in || in->width != w || in->height != h)
+      return 0;
+    // rs2_deproject_pixel_to_point asserts that it is not handed a forward
+    // model (src/rs.cpp:4296) and leaves it undistorted otherwise; the host's
+    // own undistortion is the better answer there.
+    if(in->model == RS2_DISTORTION_MODIFIED_BROWN_CONRADY)
+      return 0;
+
+    std::lock_guard l{dev->ray_lock};
+    const size_t n = size_t(w) * size_t(h) * 2;
+    if(dev->rays.size() != n || std::memcmp(&dev->rays_for, &*in, sizeof(rs2_intrinsics)) != 0)
+    {
+      dev->rays.resize(n);
+      constexpr float nan = std::numeric_limits<float>::quiet_NaN();
+      for(int v = 0; v < h; v++)
+        for(int u = 0; u < w; u++)
+        {
+          // rsutil.h:23. Pixel centres at integer coordinates, as the ABI has
+          // them; at unit depth the point is the ray (x/z, y/z, 1).
+          const float pixel[2]{float(u), float(v)};
+          float p[3]{};
+          rs2_deproject_pixel_to_point(p, &*in, pixel, 1.f);
+          const bool ok = std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2])
+                          && p[2] > 0.f;
+          float* o = dev->rays.data() + 2 * (size_t(v) * w + u);
+          o[0] = ok ? p[0] / p[2] : nan;
+          o[1] = ok ? p[1] / p[2] : nan;
+        }
+      dev->rays_for = *in;
+    }
+    std::memcpy(xy, dev->rays.data(), n * sizeof(float));
+    return 1;
+  }
+  catch(const std::exception& e)
+  {
+    set_error(e.what());
+    return 0;
+  }
+  catch(...)
+  {
+    return 0;
+  }
+}
+
+int backend_list_profiles(
+    const char* uri, uint32_t stream, depthcam_profile_cb cb, void* user)
+{
+  if(!g_context || !cb)
+    return 0;
+
+  // The formats open() asks for, so a listed mode is one it can actually get.
+  rs2_stream type{};
+  int index = -1;
+  rs2_format format{};
+  switch(stream)
+  {
+    case DEPTHCAM_STREAM_DEPTH:
+    case DEPTHCAM_STREAM_POINTCLOUD:
+      type = RS2_STREAM_DEPTH;
+      format = RS2_FORMAT_Z16;
+      break;
+    case DEPTHCAM_STREAM_COLOR:
+      type = RS2_STREAM_COLOR;
+      format = RS2_FORMAT_RGB8;
+      break;
+    case DEPTHCAM_STREAM_IR:
+      type = RS2_STREAM_INFRARED;
+      index = 1;
+      format = RS2_FORMAT_Y8;
+      break;
+    default:
+      return 0;
+  }
+
+  try
+  {
+    const auto addr = parse_uri(uri);
+    auto devices = g_context->query_devices();
+    rs2::device found;
+    switch(addr.kind)
+    {
+      case Address::Serial:
+        for(auto&& d : devices)
+          if(info_of(d, RS2_CAMERA_INFO_SERIAL_NUMBER) == addr.serial)
+            found = d;
+        break;
+      case Address::Index:
+        if(addr.index >= 0 && addr.index < int(devices.size()))
+          found = devices[addr.index];
+        break;
+      case Address::Any:
+        if(devices.size() > 0)
+          found = devices[0];
+        break;
+    }
+    if(!found)
+    {
+      set_error("RealSense not connected");
+      return 0;
+    }
+
+    // Metadata from the device list: nothing is opened.
+    std::vector<std::array<int, 3>> seen;
+    for(auto&& sensor : found.query_sensors())
+      for(auto&& p : sensor.get_stream_profiles())
+      {
+        if(p.stream_type() != type || p.format() != format)
+          continue;
+        if(index >= 0 && p.stream_index() != index)
+          continue;
+        auto vp = p.as<rs2::video_stream_profile>();
+        if(!vp)
+          continue;
+        const std::array<int, 3> key{vp.width(), vp.height(), vp.fps()};
+        if(std::find(seen.begin(), seen.end(), key) != seen.end())
+          continue;
+        seen.push_back(key);
+
+        depthcam_profile out{};
+        out.struct_size = sizeof(out);
+        out.width = key[0];
+        out.height = key[1];
+        out.fps = key[2];
+        out.format = to_depthcam_format(format);
+        cb(&out, user);
+      }
+    return 1;
+  }
+  catch(const std::exception& e)
+  {
+    set_error(e.what());
+    return 0;
+  }
+  catch(...)
+  {
+    return 0;
+  }
+}
+
+void backend_set_stream_demand(depthcam_device* dev, uint32_t streams)
+{
+  // Read once per frameset in handle(); the point cloud, the filters and the
+  // alignment are all skipped for what nobody consumes.
+  if(dev)
+    dev->demand.store(streams, std::memory_order_release);
 }
 
 depthcam_device* backend_open(const char* uri, const depthcam_open_config* config)
@@ -857,6 +1747,17 @@ depthcam_device* backend_open(const char* uri, const depthcam_open_config* confi
     for(auto&& d : devices)
       if(info_of(d, RS2_CAMERA_INFO_SERIAL_NUMBER) == serial)
         dev->rsdev = d;
+
+    dev->model = info_of(dev->rsdev, RS2_CAMERA_INFO_NAME);
+    dev->firmware = info_of(dev->rsdev, RS2_CAMERA_INFO_FIRMWARE_VERSION);
+    try
+    {
+      for(auto&& s : dev->rsdev.query_sensors())
+        dev->stereo = dev->stereo || s.is<rs2::depth_stereo_sensor>();
+    }
+    catch(...)
+    {
+    }
 
     const bool want_cloud = (config->streams & DEPTHCAM_STREAM_POINTCLOUD) != 0;
     dev->color_pointcloud = want_cloud && config->color_pointcloud != 0
@@ -922,6 +1823,18 @@ depthcam_device* backend_open(const char* uri, const depthcam_open_config* confi
         break;
     }
 
+    // What start() will get, so that the calibration can be read now. Resolving
+    // picks the profiles without streaming (rs_pipeline.hpp:314); a camera
+    // that cannot satisfy the config is found out at start() as before.
+    try
+    {
+      dev->profile = dev->config.resolve(dev->pipeline);
+    }
+    catch(const std::exception& e)
+    {
+      set_error(std::string{"stream configuration does not resolve yet: "} + e.what());
+    }
+
     return dev.release();
   }
   catch(const rs2::error& e)
@@ -948,6 +1861,12 @@ void backend_close(depthcam_device* dev)
   if(!dev)
     return;
   backend_stop(dev);
+  {
+    // A notification racing the close finds nobody to call.
+    std::lock_guard l{dev->notifier->lock};
+    dev->notifier->cb = nullptr;
+    dev->notifier->user = nullptr;
+  }
   delete dev;
 }
 
@@ -960,6 +1879,13 @@ int backend_start(depthcam_device* dev, depthcam_frame_cb on_frame, void* user)
 
   dev->on_frame = on_frame;
   dev->user = user;
+  {
+    // A restart may change what is delivered.
+    std::lock_guard l{dev->profile_lock};
+    dev->delivered_depth = {};
+    dev->delivered_color = {};
+    dev->delivered_ir = {};
+  }
   dev->running.store(true, std::memory_order_release);
 
   const auto callback = [dev](const rs2::frame& f) {
@@ -998,6 +1924,11 @@ int backend_start(depthcam_device* dev, depthcam_frame_cb on_frame, void* user)
       if(!dev->serial.empty())
         fallback.enable_device(dev->serial);
       profile = dev->pipeline.start(fallback, callback);
+    }
+
+    {
+      std::lock_guard l{dev->profile_lock};
+      dev->profile = profile;
     }
 
     // get_depth_scale() is metres per unit; the ABI wants millimetres per unit.
@@ -1071,6 +2002,14 @@ const depthcam_backend_v1 g_backend{
     .get_control = &backend_get_control,
     .set_control = &backend_set_control,
     .active_streams = &backend_active_streams,
+    .get_intrinsics = &backend_get_intrinsics,
+    .get_extrinsics = &backend_get_extrinsics,
+    .get_details = &backend_get_details,
+    .get_ray_table = &backend_get_ray_table,
+    .list_controls2 = &backend_list_controls2,
+    .set_control_changed_callback = &backend_set_control_changed_callback,
+    .list_profiles = &backend_list_profiles,
+    .set_stream_demand = &backend_set_stream_demand,
 };
 
 } // namespace
