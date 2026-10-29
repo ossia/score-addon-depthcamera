@@ -230,16 +230,6 @@ if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND TARGET libusb_static)
   # libfreenect2: only reachable by shadowing its find module. See cmake/FindLibUSB.cmake.
   list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake")
 
-  # And the same for libjpeg-turbo, which the SDK also vendors. libfreenect2
-  # requires it on Windows -- only macOS has VideoToolbox to fall back on -- so
-  # without this there is no Kinect v2 backend there at all.
-  if(TARGET turbojpeg_static)
-    set(SCORE_DEPTHCAM_TURBOJPEG_INCLUDE
-        "${SCORE_DEPTHCAM_SDK_DIR}/OrbbecSDK_v2/3rdparty/libjpeg/src"
-        CACHE INTERNAL "")
-    set(SCORE_DEPTHCAM_VENDORED_TURBOJPEG ON)
-  endif()
-
   # librealsense is handled in its own section below: the target it looks for
   # has to join an export set that only exists once it has been added.
 
@@ -417,7 +407,37 @@ if(SCORE_DEPTHCAM_BUILD_FREENECT2
     include_directories("${SCORE_DEPTHCAM_CUDA_SAMPLES_DIR}")
   endif()
 
-  add_subdirectory("${SCORE_DEPTHCAM_SDK_DIR}/libfreenect2" libfreenect2 EXCLUDE_FROM_ALL)
+  # libjpeg-turbo for the colour stream, which arrives as MJPEG. libfreenect2
+  # requires it everywhere but macOS, where VideoToolbox is the fallback.
+  #
+  # The copy the OrbbecSDK vendors, built static, whenever there is one: it
+  # keeps the shipped backend from depending on a libturbojpeg.so the user may
+  # not have, and the ossia SDK builds its own libjpeg without the TurboJPEG API,
+  # so an SDK build has no other copy to find. A system one is only used when
+  # the Orbbec SDK is not part of the build. With neither, the Kinect v2
+  # backend is skipped rather than failing the whole configuration.
+  set(_f2_jpeg_ok ON)
+  if(TARGET turbojpeg_static)
+    set(SCORE_DEPTHCAM_TURBOJPEG_INCLUDE
+        "${SCORE_DEPTHCAM_SDK_DIR}/OrbbecSDK_v2/3rdparty/libjpeg/src"
+        CACHE INTERNAL "")
+    list(PREPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/turbojpeg")
+    message(STATUS "score-addon-orbbec: Kinect v2 uses the vendored libjpeg-turbo")
+  elseif(NOT APPLE)
+    find_path(SCORE_DEPTHCAM_SYSTEM_TURBOJPEG_INCLUDE turbojpeg.h)
+    find_library(SCORE_DEPTHCAM_SYSTEM_TURBOJPEG_LIB NAMES turbojpeg libturbojpeg)
+    if(NOT SCORE_DEPTHCAM_SYSTEM_TURBOJPEG_INCLUDE OR NOT SCORE_DEPTHCAM_SYSTEM_TURBOJPEG_LIB)
+      set(_f2_jpeg_ok OFF)
+      message(STATUS
+        "score-addon-orbbec: skipping the Kinect v2 backend: libfreenect2 needs "
+        "libjpeg-turbo's TurboJPEG API, and neither the OrbbecSDK's copy nor a "
+        "system one (turbojpeg.h + libturbojpeg) is available")
+    endif()
+  endif()
+
+  if(_f2_jpeg_ok)
+    add_subdirectory("${SCORE_DEPTHCAM_SDK_DIR}/libfreenect2" libfreenect2 EXCLUDE_FROM_ALL)
+  endif()
 
   # See compat/freenect2_cl_compat.h: modern CL headers turned CL_ICDL_VERSION
   # into a macro, which breaks a local declaration of the same name in
