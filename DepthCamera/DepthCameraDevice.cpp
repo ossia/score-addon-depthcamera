@@ -478,7 +478,7 @@ InputSettingsWidget::InputSettingsWidget(QWidget* parent)
   };
 
   const auto formatRow
-      = [&](QSpinBox** w, QSpinBox** h_, QSpinBox** fps) {
+      = [&](QSpinBox** w, QSpinBox** h_, QSpinBox** fps, QComboBox** mode) {
     auto row = new QWidget{this};
     auto h = new QHBoxLayout{row};
     h->setContentsMargins(0, 0, 0, 0);
@@ -489,13 +489,35 @@ InputSettingsWidget::InputSettingsWidget(QWidget* parent)
     h->addWidget(new QLabel{QString{QChar{0x00D7}}, this});
     h->addWidget(*h_ = makeSpin(8192, nullptr));
     h->addWidget(*fps = makeSpin(1000, " fps"));
+
+    // The modes the camera says it has, when its backend can list them: a
+    // free spin box lets through combinations the camera refuses at open.
+    *mode = new QComboBox{this};
+    (*mode)->setVisible(false);
+    h->addWidget(*mode, 1);
+    QSpinBox* sw = *w;
+    QSpinBox* sh = *h_;
+    QSpinBox* sf = *fps;
+    QComboBox* cb = *mode;
+    connect(cb, &QComboBox::activated, this, [sw, sh, sf, cb](int i) {
+      const auto v = cb->itemData(i).toList();
+      if(v.size() != 3)
+        return;
+      sw->setValue(v[0].toInt());
+      sh->setValue(v[1].toInt());
+      sf->setValue(v[2].toInt());
+    });
     h->addStretch(1);
     return row;
   };
 
-  layout->addRow(tr("Color"), formatRow(&m_colorWidth, &m_colorHeight, &m_colorFps));
-  layout->addRow(tr("Infrared"), formatRow(&m_irWidth, &m_irHeight, &m_irFps));
-  layout->addRow(tr("Depth"), formatRow(&m_depthWidth, &m_depthHeight, &m_depthFps));
+  layout->addRow(
+      tr("Color"), formatRow(&m_colorWidth, &m_colorHeight, &m_colorFps, &m_colorMode));
+  layout->addRow(tr("Infrared"), formatRow(&m_irWidth, &m_irHeight, &m_irFps, &m_irMode));
+  layout->addRow(
+      tr("Depth"), formatRow(&m_depthWidth, &m_depthHeight, &m_depthFps, &m_depthMode));
+
+  connect(m_address, &QLineEdit::editingFinished, this, [this] { refreshProfiles(); });
 
   for(auto* cb : {m_rgb, m_ir, m_depth, m_pointcloud, m_colorPointcloud, m_imu,
                   m_positions, m_normals, m_mesh})
@@ -509,6 +531,101 @@ InputSettingsWidget::InputSettingsWidget(QWidget* parent)
 
   setLayout(layout);
   setSettings(InputFactory{}.defaultSettings());
+}
+
+namespace
+{
+const char* formatName(int fmt)
+{
+  switch(fmt)
+  {
+    case DEPTHCAM_FMT_RGB24:
+      return "RGB";
+    case DEPTHCAM_FMT_BGR24:
+      return "BGR";
+    case DEPTHCAM_FMT_RGBA:
+    case DEPTHCAM_FMT_BGRA:
+    case DEPTHCAM_FMT_RGB0:
+    case DEPTHCAM_FMT_BGR0:
+      return "RGBA";
+    case DEPTHCAM_FMT_GRAY8:
+      return "8-bit";
+    case DEPTHCAM_FMT_GRAY16:
+      return "16-bit";
+    case DEPTHCAM_FMT_GRAYF32:
+      return "float";
+    case DEPTHCAM_FMT_YUYV422:
+    case DEPTHCAM_FMT_UYVY422:
+      return "YUV 4:2:2";
+    case DEPTHCAM_FMT_NV12:
+    case DEPTHCAM_FMT_YUV420P:
+      return "YUV 4:2:0";
+    case DEPTHCAM_FMT_MJPEG:
+      return "MJPEG";
+    case DEPTHCAM_FMT_H264:
+      return "H.264";
+    case DEPTHCAM_FMT_H265:
+      return "H.265";
+    default:
+      return "";
+  }
+}
+}
+
+void InputSettingsWidget::refreshProfiles()
+{
+  const QString uri = currentAddress().trimmed();
+  if(uri == m_profilesFor)
+    return;
+  m_profilesFor = uri;
+
+  const auto* backend = BackendRegistry::instance().find(BackendRegistry::backendOf(uri));
+  const QByteArray u = uri.toUtf8();
+
+  const auto fill = [&](QComboBox* box, uint32_t stream, QSpinBox* w, QSpinBox* h,
+                        QSpinBox* fps) {
+    box->clear();
+    if(!backend || !backend->list_profiles || uri.isEmpty())
+    {
+      box->setVisible(false);
+      return;
+    }
+    struct Collect
+    {
+      std::vector<depthcam_profile> list;
+    } c;
+    backend->list_profiles(
+        u.constData(), stream,
+        [](const depthcam_profile* p, void* user) {
+      if(p && p->width > 0 && p->height > 0)
+        static_cast<Collect*>(user)->list.push_back(*p);
+        },
+        &c);
+    if(c.list.empty())
+    {
+      box->setVisible(false);
+      return;
+    }
+    box->addItem(tr("Mode..."), QVariant{});
+    for(const auto& p : c.list)
+    {
+      QString label = QStringLiteral("%1%2%3 @ %4 fps")
+                          .arg(p.width)
+                          .arg(QChar{0x00D7})
+                          .arg(p.height)
+                          .arg(p.fps);
+      if(const char* f = formatName(p.format); *f)
+        label += QStringLiteral(", ") + QString::fromLatin1(f);
+      box->addItem(label, QVariantList{p.width, p.height, p.fps});
+      if(p.width == w->value() && p.height == h->value() && p.fps == fps->value())
+        box->setCurrentIndex(box->count() - 1);
+    }
+    box->setVisible(true);
+  };
+
+  fill(m_colorMode, DEPTHCAM_STREAM_COLOR, m_colorWidth, m_colorHeight, m_colorFps);
+  fill(m_irMode, DEPTHCAM_STREAM_IR, m_irWidth, m_irHeight, m_irFps);
+  fill(m_depthMode, DEPTHCAM_STREAM_DEPTH, m_depthWidth, m_depthHeight, m_depthFps);
 }
 
 QString InputSettingsWidget::currentAddress() const
@@ -680,6 +797,7 @@ void InputSettingsWidget::setSettings(const Device::DeviceSettings& settings)
   m_mesh->setChecked(set.mesh);
 
   updateEnabledState();
+  refreshProfiles();
 }
 
 }
