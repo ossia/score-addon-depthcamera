@@ -74,6 +74,8 @@ struct Setup
   std::vector<std::pair<int, int>> probes;
   bool mesh{};
   bool preview{}; // read the depth outlet straight, RGBA8
+  /// The "Depth to positions" preset on the depth outlet, probed for xyz.
+  QString csf;
 };
 
 struct Shots
@@ -139,6 +141,41 @@ Shots render(score::gfx::GraphicsApi be, const Setup& s)
         p.wire(p.imageOut(hi, 0), p.sinkInput(shi));
         p.wire(p.imageOut(lo, 0), p.sinkInput(slo));
         probeSinks.emplace_back(shi, slo);
+      }
+      if(!s.csf.isEmpty())
+      {
+        const int c = p.addCsf(s.csf);
+        if(c < 0)
+        {
+          r.error = "the preset did not build: " + p.error();
+          return;
+        }
+        // Its controls, in declaration order after the image: focal,
+        // principal, fov, scale, near, far.
+        std::vector<int> controls;
+        auto* isf = p.isf(c);
+        for(std::size_t i = 0; i < isf->input.size(); i++)
+          if(isf->input[i]->type != score::gfx::Types::Image)
+            controls.push_back(int(i));
+        const auto cam = syn::depthCamera(W, H, false);
+        if(controls.size() >= 2)
+        {
+          setControl(*isf, controls[0], ossia::vec2f{float(cam.fx), float(cam.fy)});
+          setControl(*isf, controls[1], ossia::vec2f{float(cam.cx), float(cam.cy)});
+        }
+        p.wire(p.nodeImageOut(node, DepthStreamNode::DepthOut), p.imageIn(c, 0));
+        for(int comp : {0, 1, 2, 3})
+        {
+          const int hi = p.addIsf(writeProbe(dir, comp, true));
+          const int lo = p.addIsf(writeProbe(dir, comp, false));
+          const int shi = p.addSink({W, H});
+          const int slo = p.addSink({W, H});
+          p.wire(p.imageOut(c, 0), p.imageIn(hi, 0));
+          p.wire(p.imageOut(c, 0), p.imageIn(lo, 0));
+          p.wire(p.imageOut(hi, 0), p.sinkInput(shi));
+          p.wire(p.imageOut(lo, 0), p.sinkInput(slo));
+          probeSinks.emplace_back(shi, slo);
+        }
       }
       int previewSink = -1;
       if(s.preview)
@@ -461,4 +498,41 @@ TEST_CASE("Infrared is scaled by its gain", "[depthcam][gfx]")
     const double want = syn::irAt(u, v, r.frameNumber, 150.) / 65535. * 2.;
     CHECK(r.floats[0][std::size_t(v) * W + u] == Catch::Approx(want).epsilon(1e-6));
   }
+}
+
+TEST_CASE("The Depth to positions preset agrees with the device", "[depthcam][gfx][csf]")
+{
+  const auto backend = GENERATE(from_range(platform_backends()));
+  CAPTURE(backend_name(backend));
+  Setup s;
+  s.csf = QStringLiteral(DEPTHCAM_PRESET_DIR "/Compute Shader/Depth to positions.cs");
+  s.probes = {{DepthStreamNode::PositionsOut, 0}, {DepthStreamNode::PositionsOut, 1},
+              {DepthStreamNode::PositionsOut, 2}, {DepthStreamNode::PositionsOut, 3}};
+  const auto r = render(backend, s);
+  SKIP_OR_REQUIRE(r);
+  REQUIRE(r.floats.size() == 8);
+  double worst = 0;
+  int valid = 0;
+  std::string first;
+  for(std::size_t i = 0; i < std::size_t(W * H); i++)
+  {
+    // The device's positions, then the preset's.
+    CHECK(r.floats[3][i] == r.floats[7][i]);
+    if(r.floats[3][i] == 0.f)
+      continue;
+    valid++;
+    for(int c = 0; c < 3; c++)
+    {
+      const double d = std::abs(r.floats[c][i] - r.floats[4 + c][i]);
+      if(d > 1e-5 && worst <= 1e-5)
+        first = "first mismatch at (" + std::to_string(i % W) + ", "
+                + std::to_string(i / W) + ") component " + std::to_string(c)
+                + ": device " + std::to_string(r.floats[c][i]) + " preset "
+                + std::to_string(r.floats[4 + c][i]);
+      worst = std::max(worst, d);
+    }
+  }
+  CHECK(valid == W * H - syn::dropout * syn::dropout);
+  INFO(first);
+  CHECK(worst < 1e-5);
 }
