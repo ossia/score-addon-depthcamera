@@ -1,10 +1,10 @@
 {
   "name": "Depth cameras",
   "raw_name": "score-addon-orbbec",
-  "version": "1.0",
+  "version": "2.0",
   "kind": "addon",
-  "short": "Orbbec and Kinect depth camera support",
-  "long": "Streams color, infrared, depth and point clouds from Orbbec cameras (Femto Mega/Bolt, Gemini, Astra) over USB and Ethernet.",
+  "short": "Depth cameras: Orbbec, Kinect v1/v2, Azure Kinect, Intel RealSense, Oak3DVision and Luxonis OAK",
+  "long": "Streams color, infrared, metric depth, IMU and point clouds from depth cameras, with per-camera calibration (intrinsics, distortion, extrinsics), timestamps, GPU positions/normals/mesh outputs and the camera's own controls, filters and presets. Camera SDKs come from the depth-camera package.",
   "key": "efc2818e-89c0-4741-b949-6c7cd82a1257",
-  "url": "https://github.com/ossia/score-addon-orbbec"
+  "url": "https://github.com/ossia/score-addon-depthcamera"
 }

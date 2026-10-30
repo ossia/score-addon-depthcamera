@@ -6,6 +6,6 @@
     "kind": "library",
     "short": "Backends for Orbbec, Kinect, Azure Kinect, Intel RealSense, Oak3DVision and Luxonis depth cameras",
     "long": "Camera SDKs for the Depth Camera Input device: Orbbec (Femto Mega/Bolt, Gemini, Astra, over USB and Ethernet), Kinect v1, Kinect v2, Azure Kinect DK, Intel RealSense, the Oak3DVision Oak CDK/QCDK time-of-flight modules and the Luxonis OAK range (OAK-D, OAK-1 and OAK-4, over USB and Ethernet). One shared object per SDK, each exporting a single symbol, so several camera families can be used in the same session.",
-    "url": "https://github.com/ossia/score-addon-orbbec",
+    "url": "https://github.com/ossia/score-addon-depthcamera",
     "architecture": "@SCORE_DEPTHCAM_ARCH@"
 }
