@@ -1230,6 +1230,7 @@ DepthStreamNode::createRenderer(score::gfx::RenderList&) const noexcept
 void DepthStreamNode::process(score::gfx::Message&& msg)
 {
   ProcessNode::process(std::move(msg));
+  InputStream::checkHealth(stream);
   if(!renderedNodes.empty())
     if(auto* f = frames.m_decoder->dequeue_frame())
       frames.updateCurrentFrame(f);

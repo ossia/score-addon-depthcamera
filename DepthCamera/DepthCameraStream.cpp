@@ -9,6 +9,8 @@
 #include <QDebug>
 
 #include <chrono>
+#include <thread>
+#include <string>
 #include <utility>
 
 namespace Gfx::DepthCamera
@@ -149,6 +151,14 @@ InputStream::InputStream(
       break;
   }
 
+  m_requested = cfg.streams & ~uint32_t(DEPTHCAM_STREAM_IMU);
+  m_requestedSize[0][0] = cfg.color_width;
+  m_requestedSize[0][1] = cfg.color_height;
+  m_requestedSize[1][0] = cfg.ir_width;
+  m_requestedSize[1][1] = cfg.ir_height;
+  m_requestedSize[2][0] = cfg.depth_width;
+  m_requestedSize[2][1] = cfg.depth_height;
+
   const auto u = uri.toUtf8();
   m_device = m_backend->open(u.constData(), &cfg);
   if(!m_device)
@@ -187,10 +197,19 @@ void InputStream::setStartGate(std::shared_future<void> gate) noexcept
   m_startGate = std::move(gate);
 }
 
+static bool depthcamTrace()
+{
+  static const bool t = qEnvironmentVariableIsSet("SCORE_DEPTHCAM_TRACE");
+  return t;
+}
+
 void InputStream::addConsumer(StreamOutput& out, int delta) noexcept
 {
   const int before = out.consumers.fetch_add(delta, std::memory_order_acq_rel);
   const int after = before + delta;
+  if(depthcamTrace())
+    qDebug() << "[depthcam-trace] consumers of stream" << out.stream << before << "->"
+             << after;
   if((before > 0) != (after > 0))
     pushDemand();
 }
@@ -206,6 +225,9 @@ uint32_t InputStream::demand() const noexcept
 
 void InputStream::pushDemand() noexcept
 {
+  if(depthcamTrace())
+    qDebug() << "[depthcam-trace] demand" << demand() << "running"
+             << m_running.load(std::memory_order_acquire);
   if(m_device && m_backend && m_backend->set_stream_demand
      && m_running.load(std::memory_order_acquire))
     m_backend->set_stream_demand(m_device, demand());
@@ -231,11 +253,44 @@ bool InputStream::start() noexcept
   m_stopVotes.store(0, std::memory_order_relaxed);
   m_running.store(true, std::memory_order_release);
 
-  if(!m_backend->start(m_device, &InputStream::onFrameThunk, this))
+  // A camera released by another process a moment ago can refuse to start
+  // (librealsense: "failed to set power state"); it comes up on a retry, at
+  // times only after several seconds.
+  // A start that only succeeds on the camera's default configuration (the
+  // RealSense backend falls back silently, which typically drops the infrared
+  // stream) is retried as well, and only accepted at the last attempt.
+  auto lastError = [this]() -> std::string {
+    const char* e = m_backend->last_error ? m_backend->last_error() : nullptr;
+    return e ? e : "";
+  };
+  constexpr int attempts = 8;
+  bool started = false;
+  for(int attempt = 0; attempt < attempts && !started; attempt++)
   {
-    const char* err = m_backend->last_error ? m_backend->last_error() : nullptr;
-    qDebug() << "[depthcam] could not start streaming:"
-             << (err ? err : "no reason given");
+    if(attempt > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(std::min(2000, 250 << (attempt - 1))));
+    const std::string before = lastError();
+    started = m_backend->start(m_device, &InputStream::onFrameThunk, this);
+    const std::string after = lastError();
+    if(!started)
+    {
+      qWarning() << "[depthcam] could not start streaming, attempt" << attempt + 1 << ":"
+                 << (after.empty() ? "no reason given" : after.c_str());
+      continue;
+    }
+    if(after != before && after.find("falling back") != std::string::npos)
+    {
+      qWarning() << "[depthcam] started on the camera's default configuration, attempt"
+                 << attempt + 1 << ":" << after.c_str();
+      if(attempt + 1 < attempts && m_backend->stop)
+      {
+        m_backend->stop(m_device);
+        started = false;
+      }
+    }
+  }
+  if(!started)
+  {
     m_running.store(false, std::memory_order_release);
     return false;
   }
@@ -247,6 +302,13 @@ bool InputStream::start() noexcept
     o->first_host_ns = 0;
     o->last_device_ns = 0;
   }
+  m_seen.store(0, std::memory_order_release);
+  m_degraded.store(false, std::memory_order_release);
+  m_startedAtMs.store(
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+          std::chrono::steady_clock::now().time_since_epoch())
+          .count(),
+      std::memory_order_release);
   pushDemand();
   return true;
 }
@@ -264,6 +326,70 @@ void InputStream::stop() noexcept
   m_ir.queue.drain();
   m_depth.queue.drain();
   m_pcl.queue.drain();
+}
+
+void InputStream::noteFirstFrame(const depthcam_frame& f) noexcept
+{
+  if(depthcamTrace())
+    qDebug() << "[depthcam-trace] first frame of stream" << f.stream << f.width << "x"
+             << f.height << "format" << f.format;
+  int idx = -1;
+  switch(f.stream)
+  {
+    case DEPTHCAM_STREAM_COLOR:
+      idx = 0;
+      break;
+    case DEPTHCAM_STREAM_IR:
+      idx = 1;
+      break;
+    case DEPTHCAM_STREAM_DEPTH:
+      idx = 2;
+      break;
+    default:
+      return;
+  }
+  const int w = m_requestedSize[idx][0], h = m_requestedSize[idx][1];
+  if(w > 0 && h > 0 && (f.width != w || f.height != h))
+  {
+    qWarning() << "[depthcam] stream" << f.stream << "came up at" << f.width << "x"
+               << f.height << "instead of" << w << "x" << h;
+    m_degraded.store(true, std::memory_order_release);
+  }
+}
+
+void InputStream::checkHealth(const std::shared_ptr<InputStream>& self) noexcept
+{
+  if(!self || !self->running() || self->m_restarting.load(std::memory_order_acquire))
+    return;
+  if(self->m_restarts.load(std::memory_order_acquire) >= 3)
+    return;
+  const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+                          std::chrono::steady_clock::now().time_since_epoch())
+                          .count();
+  if(now - self->m_startedAtMs.load(std::memory_order_acquire) < 3000)
+    return;
+
+  bool restart = self->m_degraded.load(std::memory_order_acquire);
+  const uint32_t seen = self->m_seen.load(std::memory_order_acquire);
+  if(!restart && seen != 0)
+  {
+    for(const StreamOutput* o : {&self->m_rgb, &self->m_ir, &self->m_depth})
+      if((self->m_requested & o->stream) && !(seen & o->stream)
+         && o->consumers.load(std::memory_order_acquire) > 0)
+        restart = true;
+  }
+  if(!restart || self->m_restarting.exchange(true))
+    return;
+
+  const int n = self->m_restarts.fetch_add(1) + 1;
+  qWarning() << "[depthcam] the camera is not delivering what was asked; restarting it"
+             << "(" << n << "/ 3 )";
+  std::thread([s = self] {
+    s->stop();
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    s->start();
+    s->m_restarting.store(false, std::memory_order_release);
+  }).detach();
 }
 
 void InputStream::requestStop() noexcept
@@ -284,6 +410,8 @@ void InputStream::onFrame(const depthcam_frame& f)
     return;
   if(!f.data || f.bytes == 0)
     return;
+  if(!(m_seen.fetch_or(f.stream, std::memory_order_acq_rel) & f.stream))
+    noteFirstFrame(f);
 
   switch(f.stream)
   {

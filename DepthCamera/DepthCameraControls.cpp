@@ -12,6 +12,9 @@
 
 #include <QDebug>
 
+#include <cstdlib>
+#include <thread>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -740,7 +743,24 @@ void ControlTree::writeOne(
                        && m_stream->running();
   if(restart)
     m_stream->stop();
-  m_backend.set_control(&m_device, e.id.c_str(), value);
+  // librealsense refuses a write while the USB device is changing power state
+  // ("failed to set power state"); it goes through a moment later.
+  bool written = false;
+  for(int attempt = 0; attempt < 4 && !written; attempt++)
+  {
+    if(attempt > 0)
+      std::this_thread::sleep_for(std::chrono::milliseconds(150 * attempt));
+    written = m_backend.set_control(&m_device, e.id.c_str(), value);
+    if(written)
+      break;
+    const char* err = m_backend.last_error ? m_backend.last_error() : nullptr;
+    if(!err || !std::strstr(err, "power state") || attempt == 3)
+    {
+      qWarning() << "[depthcam] the camera refused" << e.id.c_str() << "=" << value << ":"
+                 << (err ? err : "no reason given");
+      break;
+    }
+  }
   if(restart)
   {
     m_stream->start();
@@ -1067,9 +1087,21 @@ bool ControlTree::write(const ossia::net::parameter_base& param, const ossia::va
           for(int i = 0; i < c.enum_count && found < 0; i++)
             if(c.enum_labels[i] && *s == c.enum_labels[i])
               found = i;
-          if(found < 0)
+          if(found >= 0)
+          {
+            raw = c.min + found * (c.step > 0 ? c.step : 1);
+            break;
+          }
+          // The parameter is a string, so a number written to it arrives as
+          // its text: "0" is the raw value 0, not an unknown label.
+          char* end{};
+          const double num = std::strtod(s->c_str(), &end);
+          if(s->empty() || end != s->c_str() + s->size())
+          {
+            qWarning() << "[depthcam] unknown value" << s->c_str() << "for" << c.name;
             return false;
-          raw = c.min + found * (c.step > 0 ? c.step : 1);
+          }
+          raw = num;
           break;
         }
       }

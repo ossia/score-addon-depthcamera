@@ -112,6 +112,18 @@ public:
 
   bool start() noexcept;
   void stop() noexcept;
+
+  /**
+   * @brief Restarts a camera that came up in another configuration than asked.
+   *
+   * A camera can start silently on its default profile (librealsense falls
+   * back when the requested one fails transiently, e.g. right after another
+   * process released the device), which typically drops the infrared stream:
+   * a first frame of another size than requested, or a consumed stream that
+   * gets no frame while the others do, triggers a restart on a worker thread,
+   * at most a few times. Called by the graphics nodes once per frame.
+   */
+  static void checkHealth(const std::shared_ptr<InputStream>& self) noexcept;
   bool running() const noexcept { return m_running.load(std::memory_order_acquire); }
 
   /// Stops and hands the camera back, leaving this object alive but inert.
@@ -199,6 +211,15 @@ private:
   std::recursive_mutex m_lifecycle;
 
   void pushDemand() noexcept;
+  void noteFirstFrame(const depthcam_frame& f) noexcept;
+
+  uint32_t m_requested{};
+  int m_requestedSize[3][2]{};
+  std::atomic<uint32_t> m_seen{0};
+  std::atomic_bool m_degraded{false};
+  std::atomic_bool m_restarting{false};
+  std::atomic<int> m_restarts{0};
+  std::atomic<int64_t> m_startedAtMs{0};
   void stamp(StreamOutput& out, const depthcam_frame& f, AVFrame* av) noexcept;
 };
 

@@ -13,7 +13,7 @@
 // because console.log is not routed to stdout in this configuration.
 
 var PROTOCOL = "a3bd48ba-f5db-43b7-aa92-2b1a37a88a79"; // Depth Camera Input
-var REPORT = "/tmp/e2e_report.txt";
+var REPORT = "/tmp/depthcam_report.txt";
 
 var out = [];
 var failures = 0, checks = 0;
