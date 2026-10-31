@@ -167,6 +167,8 @@ std::string option_slug(rs2_option opt)
   for(auto& c : n)
     c = (c == ' ' || c == '-' || c == '/') ? '_'
                                            : char(std::tolower((unsigned char)c));
+  if(n.starts_with("enable_auto_"))
+    n.erase(0, 7);
   return n;
 }
 
@@ -863,6 +865,15 @@ ControlEntry* depthcam_device::findControl(const char* id)
   for(auto& e : controls)
     if(e.path == id)
       return &e;
+  std::string_view v{id};
+  if(auto p = v.find("/enable_auto_"); p != std::string_view::npos)
+  {
+    std::string legacy{v};
+    legacy.erase(p + 1, 7);
+    for(auto& e : controls)
+      if(e.path == legacy)
+        return &e;
+  }
   return nullptr;
 }
 
@@ -1929,6 +1940,36 @@ int backend_start(depthcam_device* dev, depthcam_frame_cb on_frame, void* user)
     {
       std::lock_guard l{dev->profile_lock};
       dev->profile = profile;
+    }
+
+    // Options written through the device handle enumerated at open are
+    // refused while the pipeline streams ("failed to set power state"): the
+    // pipeline powers its own instance of the device. The controls are moved
+    // to that instance's sensors, matched by name.
+    try
+    {
+      std::lock_guard cl{dev->control_lock};
+      auto streaming = profile.get_device().query_sensors();
+      for(auto& e : dev->controls)
+      {
+        if(e.filter >= 0 || e.is_enable || !e.sensor)
+          continue;
+        const char* want = e.sensor.supports(RS2_CAMERA_INFO_NAME)
+                               ? e.sensor.get_info(RS2_CAMERA_INFO_NAME)
+                               : nullptr;
+        if(!want)
+          continue;
+        for(auto& s : streaming)
+          if(s.supports(RS2_CAMERA_INFO_NAME)
+             && std::strcmp(s.get_info(RS2_CAMERA_INFO_NAME), want) == 0)
+          {
+            e.sensor = s;
+            break;
+          }
+      }
+    }
+    catch(...)
+    {
     }
 
     // get_depth_scale() is metres per unit; the ABI wants millimetres per unit.
