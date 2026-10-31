@@ -12,7 +12,7 @@
 
 #include <QDebug>
 
-#include <cstdlib>
+#include <charconv>
 #include <thread>
 
 #include <algorithm>
@@ -351,7 +351,13 @@ ControlTree::ControlTree(
   applySaved(saved);
   post({.kind = Request::Gate});
   if(m_stream)
+  {
     m_stream->setStartGate(m_replayed);
+    if(m_onRestarted)
+      m_stream->setRestartedCallback([this] {
+        ossia::qt::run_async(&m_context, [this] { m_onRestarted(); });
+      });
+  }
   refresh();
 }
 
@@ -360,6 +366,8 @@ ControlTree::~ControlTree()
   // Nothing may call back into a tree that is going away.
   if(m_backend.set_control_changed_callback)
     m_backend.set_control_changed_callback(&m_device, nullptr, nullptr);
+  if(m_stream && m_onRestarted)
+    m_stream->setRestartedCallback({});
 
   // The worker first, and joined, not just signalled: it reads through
   // m_backend at a device that is closed as soon as this returns.
@@ -619,6 +627,25 @@ int ControlTree::indexOf(std::string_view id) const noexcept
   return -1;
 }
 
+int ControlTree::indexOfSaved(std::string& id) const noexcept
+{
+  if(const int i = indexOf(id); i >= 0)
+    return i;
+  // The RealSense backend published color/enable_auto_exposure until it was
+  // named like the other backends' color/auto_exposure.
+  if(const auto p = id.find("/enable_auto_"); p != std::string::npos)
+  {
+    std::string renamed = id;
+    renamed.erase(p + 1, 7);
+    if(const int i = indexOf(renamed); i >= 0)
+    {
+      id = std::move(renamed);
+      return i;
+    }
+  }
+  return -1;
+}
+
 ControlTree::Entry* ControlTree::find(const ossia::net::parameter_base& param) noexcept
 {
   const int i = indexOf(param);
@@ -633,15 +660,16 @@ ossia::net::parameter_base* ControlTree::parameter(std::string_view id) const no
 
 void ControlTree::applySaved(const ControlValues& saved)
 {
-  for(const auto& s : saved)
+  for(auto s : saved)
   {
     if(s.value.empty())
       continue;
-    const auto id = s.id.toStdString();
-    const int idx = indexOf(id);
+    auto id = s.id.toStdString();
+    const int idx = indexOfSaved(id);
     if(idx < 0)
       continue; // a control this camera does not have, or no longer has
     auto& e = *m_entries[std::size_t(idx)];
+    s.id = QString::fromStdString(id);
 
     {
       std::lock_guard l{m_store_lock};
@@ -744,22 +772,38 @@ void ControlTree::writeOne(
   if(restart)
     m_stream->stop();
   // librealsense refuses a write while the USB device is changing power state
-  // ("failed to set power state"); it goes through a moment later.
+  // ("failed to set power state"); it goes through a moment later. The waits
+  // are bounded per refusing spell, not per write, as a whole saved record can
+  // be refused at once while start() waits for it.
   bool written = false;
-  for(int attempt = 0; attempt < 4 && !written; attempt++)
+  std::string err;
+  for(int attempt = 0; attempt < 4; attempt++)
   {
-    if(attempt > 0)
-      std::this_thread::sleep_for(std::chrono::milliseconds(150 * attempt));
     written = m_backend.set_control(&m_device, e.id.c_str(), value);
     if(written)
       break;
-    const char* err = m_backend.last_error ? m_backend.last_error() : nullptr;
-    if(!err || !std::strstr(err, "power state") || attempt == 3)
-    {
-      qWarning() << "[depthcam] the camera refused" << e.id.c_str() << "=" << value << ":"
-                 << (err ? err : "no reason given");
+    const char* le = m_backend.last_error ? m_backend.last_error() : nullptr;
+    err = le ? le : "";
+    if(err.find("power state") == std::string::npos)
       break;
-    }
+    const auto now = std::chrono::steady_clock::now();
+    if(now - m_lastPowerRefusal > std::chrono::seconds(5))
+      m_powerRetryUntil = now + std::chrono::seconds(2);
+    m_lastPowerRefusal = now;
+    if(attempt == 3 || now >= m_powerRetryUntil)
+      break;
+    std::this_thread::sleep_for(std::chrono::milliseconds(150 * (attempt + 1)));
+  }
+  if(written)
+  {
+    m_lastPowerRefusal = {};
+    e.refusal.reset();
+  }
+  else if(e.refusal != err)
+  {
+    qWarning() << "[depthcam] the camera refused" << e.id.c_str() << "=" << value << ":"
+               << (err.empty() ? "no reason given" : err.c_str());
+    e.refusal = err;
   }
   if(restart)
   {
@@ -1094,9 +1138,12 @@ bool ControlTree::write(const ossia::net::parameter_base& param, const ossia::va
           }
           // The parameter is a string, so a number written to it arrives as
           // its text: "0" is the raw value 0, not an unknown label.
-          char* end{};
-          const double num = std::strtod(s->c_str(), &end);
-          if(s->empty() || end != s->c_str() + s->size())
+          const int step = c.step > 0 ? int(c.step) : 1;
+          const int lo = int(c.min), hi = lo + (c.enum_count - 1) * step;
+          int num{};
+          const auto [end, ec] = std::from_chars(s->data(), s->data() + s->size(), num);
+          if(s->empty() || ec != std::errc{} || end != s->data() + s->size() || num < lo
+             || num > hi || (num - lo) % step != 0)
           {
             qWarning() << "[depthcam] unknown value" << s->c_str() << "for" << c.name;
             return false;

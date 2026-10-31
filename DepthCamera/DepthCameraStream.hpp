@@ -7,10 +7,14 @@
 #include <QString>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <thread>
 
 namespace Gfx::DepthCamera
 {
@@ -65,6 +69,10 @@ struct StreamOutput
   /// and the backend is told it need not produce the stream at all.
   std::atomic<int> consumers{0};
 
+  /// Steady-clock milliseconds at which consumers last went above zero, 0
+  /// while there are none.
+  std::atomic<int64_t> demanded_since_ms{0};
+
   /// Camera thread only.
   StreamStats stats;
   uint64_t first_device_ns{};
@@ -110,18 +118,23 @@ public:
   /// the IMU, which has no graphics node and is wanted whenever it is open.
   uint32_t demand() const noexcept;
 
+  /**
+   * @brief One attempt, on the calling thread.
+   *
+   * A camera that refuses to start, or only starts on its default
+   * configuration (the RealSense backend falls back and says so), is retried
+   * on this object's worker thread with a backoff; false is returned
+   * meanwhile. stop() and close() cancel the retries.
+   */
   bool start() noexcept;
   void stop() noexcept;
 
   /**
-   * @brief Restarts a camera that came up in another configuration than asked.
+   * @brief Restarts a camera that stopped delivering a stream it was asked for.
    *
-   * A camera can start silently on its default profile (librealsense falls
-   * back when the requested one fails transiently, e.g. right after another
-   * process released the device), which typically drops the infrared stream:
-   * a first frame of another size than requested, or a consumed stream that
-   * gets no frame while the others do, triggers a restart on a worker thread,
-   * at most a few times. Called by the graphics nodes once per frame.
+   * A consumed stream that has had no frame for 3 s of demand while the others
+   * do restarts the camera on the worker thread, at most three times per
+   * start(). Called by the depth and infrared nodes once per frame.
    */
   static void checkHealth(const std::shared_ptr<InputStream>& self) noexcept;
   bool running() const noexcept { return m_running.load(std::memory_order_acquire); }
@@ -174,6 +187,10 @@ public:
    */
   void setImuCallback(imu_callback cb) noexcept;
 
+  /// After the worker thread started the camera. Called on the worker thread;
+  /// clearing it returns only once no call is in flight.
+  void setRestartedCallback(std::function<void()> cb) noexcept;
+
 private:
   static void onFrameThunk(const depthcam_frame* f, void* user);
   void onFrame(const depthcam_frame& f);
@@ -206,18 +223,51 @@ private:
 
   std::shared_future<void> m_startGate;
 
-  /// start() and stop() come from the execution engine, the GUI and the
-  /// control worker (a restart for a depth mode).
+  /// start() and stop() come from the execution engine, the GUI, the control
+  /// worker (a restart for a depth mode) and this object's worker.
   std::recursive_mutex m_lifecycle;
+  bool m_closed{};
 
   void pushDemand() noexcept;
   void noteFirstFrame(const depthcam_frame& f) noexcept;
 
+  enum class Attempt
+  {
+    Started,
+    Fallback,
+    Failed,
+  };
+  Attempt attemptStart(int attempt, bool acceptFallback) noexcept;
+  void stopLocked() noexcept;
+
+  struct Job
+  {
+    uint64_t intent{};
+    int firstAttempt{};
+    bool restart{};
+  };
+  bool post(Job job) noexcept;
+  void runWorker() noexcept;
+  void runJob(const Job& job) noexcept;
+  bool sleepFor(std::chrono::milliseconds d, uint64_t intent) noexcept;
+  void notifyRestarted() noexcept;
+
+  /// Bumped by stop() and close(): a pending retry or restart that was
+  /// scheduled under another value is dropped.
+  std::atomic<uint64_t> m_intent{0};
+  std::mutex m_worker_mutex;
+  std::condition_variable m_worker_cv;
+  std::optional<Job> m_job;
+  bool m_shutdown{};
+  std::thread m_worker;
+
+  std::mutex m_restarted_mutex;
+  std::function<void()> m_restarted_cb;
+
   uint32_t m_requested{};
-  int m_requestedSize[3][2]{};
+  std::atomic<uint32_t> m_active{0};
   std::atomic<uint32_t> m_seen{0};
-  std::atomic_bool m_degraded{false};
-  std::atomic_bool m_restarting{false};
+  std::atomic_bool m_started{false};
   std::atomic<int> m_restarts{0};
   std::atomic<int64_t> m_startedAtMs{0};
   void stamp(StreamOutput& out, const depthcam_frame& f, AVFrame* av) noexcept;

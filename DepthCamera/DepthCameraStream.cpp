@@ -8,8 +8,8 @@
 
 #include <QDebug>
 
+#include <algorithm>
 #include <chrono>
-#include <thread>
 #include <string>
 #include <utility>
 
@@ -152,12 +152,6 @@ InputStream::InputStream(
   }
 
   m_requested = cfg.streams & ~uint32_t(DEPTHCAM_STREAM_IMU);
-  m_requestedSize[0][0] = cfg.color_width;
-  m_requestedSize[0][1] = cfg.color_height;
-  m_requestedSize[1][0] = cfg.ir_width;
-  m_requestedSize[1][1] = cfg.ir_height;
-  m_requestedSize[2][0] = cfg.depth_width;
-  m_requestedSize[2][1] = cfg.depth_height;
 
   const auto u = uri.toUtf8();
   m_device = m_backend->open(u.constData(), &cfg);
@@ -186,7 +180,19 @@ uint32_t InputStream::activeStreams() const noexcept
 
 void InputStream::close() noexcept
 {
-  stop();
+  {
+    std::lock_guard l{m_worker_mutex};
+    m_intent.fetch_add(1, std::memory_order_acq_rel);
+    m_shutdown = true;
+    m_job.reset();
+  }
+  m_worker_cv.notify_all();
+  if(m_worker.joinable())
+    m_worker.join();
+
+  std::lock_guard lifecycle{m_lifecycle};
+  m_closed = true;
+  stopLocked();
   if(m_device && m_backend && m_backend->close)
     m_backend->close(m_device);
   m_device = nullptr;
@@ -203,10 +209,21 @@ static bool depthcamTrace()
   return t;
 }
 
+static int64_t steadyMs() noexcept
+{
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::steady_clock::now().time_since_epoch())
+      .count();
+}
+
 void InputStream::addConsumer(StreamOutput& out, int delta) noexcept
 {
   const int before = out.consumers.fetch_add(delta, std::memory_order_acq_rel);
   const int after = before + delta;
+  if(before <= 0 && after > 0)
+    out.demanded_since_ms.store(steadyMs(), std::memory_order_release);
+  else if(before > 0 && after <= 0)
+    out.demanded_since_ms.store(0, std::memory_order_release);
   if(depthcamTrace())
     qDebug() << "[depthcam-trace] consumers of stream" << out.stream << before << "->"
              << after;
@@ -233,10 +250,20 @@ void InputStream::pushDemand() noexcept
     m_backend->set_stream_demand(m_device, demand());
 }
 
+namespace
+{
+constexpr int start_attempts = 8;
+
+std::chrono::milliseconds startBackoff(int attempt) noexcept
+{
+  return std::chrono::milliseconds(attempt > 0 ? std::min(2000, 250 << (attempt - 1)) : 0);
+}
+}
+
 bool InputStream::start() noexcept
 {
   std::lock_guard lifecycle{m_lifecycle};
-  if(!m_device || !m_backend || !m_backend->start)
+  if(m_closed || !m_device || !m_backend || !m_backend->start)
     return false;
   if(m_running.load(std::memory_order_acquire))
     return true;
@@ -250,51 +277,19 @@ bool InputStream::start() noexcept
     m_startGate = {};
   }
 
-  m_stopVotes.store(0, std::memory_order_relaxed);
-  m_running.store(true, std::memory_order_release);
+  m_restarts.store(0, std::memory_order_release);
+  const uint64_t intent = m_intent.load(std::memory_order_acquire);
+  if(attemptStart(0, false) == Attempt::Started)
+    return true;
 
   // A camera released by another process a moment ago can refuse to start
-  // (librealsense: "failed to set power state"); it comes up on a retry, at
-  // times only after several seconds.
-  // A start that only succeeds on the camera's default configuration (the
-  // RealSense backend falls back silently, which typically drops the infrared
-  // stream) is retried as well, and only accepted at the last attempt.
-  auto lastError = [this]() -> std::string {
-    const char* e = m_backend->last_error ? m_backend->last_error() : nullptr;
-    return e ? e : "";
-  };
-  constexpr int attempts = 8;
-  bool started = false;
-  for(int attempt = 0; attempt < attempts && !started; attempt++)
-  {
-    if(attempt > 0)
-      std::this_thread::sleep_for(std::chrono::milliseconds(std::min(2000, 250 << (attempt - 1))));
-    const std::string before = lastError();
-    started = m_backend->start(m_device, &InputStream::onFrameThunk, this);
-    const std::string after = lastError();
-    if(!started)
-    {
-      qWarning() << "[depthcam] could not start streaming, attempt" << attempt + 1 << ":"
-                 << (after.empty() ? "no reason given" : after.c_str());
-      continue;
-    }
-    if(after != before && after.find("falling back") != std::string::npos)
-    {
-      qWarning() << "[depthcam] started on the camera's default configuration, attempt"
-                 << attempt + 1 << ":" << after.c_str();
-      if(attempt + 1 < attempts && m_backend->stop)
-      {
-        m_backend->stop(m_device);
-        started = false;
-      }
-    }
-  }
-  if(!started)
-  {
-    m_running.store(false, std::memory_order_release);
-    return false;
-  }
+  // (librealsense: "failed to set power state") for several seconds.
+  post({.intent = intent, .firstAttempt = 1});
+  return false;
+}
 
+InputStream::Attempt InputStream::attemptStart(int attempt, bool acceptFallback) noexcept
+{
   for(StreamOutput* o : {&m_rgb, &m_depth, &m_ir, &m_pcl})
   {
     o->stats = {};
@@ -303,19 +298,55 @@ bool InputStream::start() noexcept
     o->last_device_ns = 0;
   }
   m_seen.store(0, std::memory_order_release);
-  m_degraded.store(false, std::memory_order_release);
-  m_startedAtMs.store(
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::steady_clock::now().time_since_epoch())
-          .count(),
-      std::memory_order_release);
+  m_started.store(false, std::memory_order_release);
+  m_stopVotes.store(0, std::memory_order_relaxed);
+  m_running.store(true, std::memory_order_release);
+
+  const bool ok = m_backend->start(m_device, &InputStream::onFrameThunk, this);
+  const char* e = m_backend->last_error ? m_backend->last_error() : nullptr;
+  const std::string err = e ? e : "";
+  if(!ok)
+  {
+    m_running.store(false, std::memory_order_release);
+    qWarning() << "[depthcam] could not start streaming, attempt" << attempt + 1 << ":"
+               << (err.empty() ? "no reason given" : err.c_str());
+    return Attempt::Failed;
+  }
+
+  if(err.find("falling back") != std::string::npos)
+  {
+    qWarning() << "[depthcam] started on the camera's default configuration, attempt"
+               << attempt + 1 << ":" << err.c_str();
+    if(!acceptFallback && m_backend->stop)
+    {
+      stopLocked();
+      return Attempt::Fallback;
+    }
+  }
+
+  m_active.store(activeStreams(), std::memory_order_release);
+  m_startedAtMs.store(steadyMs(), std::memory_order_release);
+  m_started.store(true, std::memory_order_release);
   pushDemand();
-  return true;
+  return Attempt::Started;
 }
 
 void InputStream::stop() noexcept
 {
+  {
+    std::lock_guard l{m_worker_mutex};
+    m_intent.fetch_add(1, std::memory_order_acq_rel);
+    m_job.reset();
+  }
+  m_worker_cv.notify_all();
+
   std::lock_guard lifecycle{m_lifecycle};
+  stopLocked();
+}
+
+void InputStream::stopLocked() noexcept
+{
+  m_started.store(false, std::memory_order_release);
   if(!m_running.exchange(false, std::memory_order_acq_rel))
     return;
 
@@ -328,68 +359,151 @@ void InputStream::stop() noexcept
   m_pcl.queue.drain();
 }
 
+bool InputStream::post(Job job) noexcept
+{
+  {
+    std::lock_guard l{m_worker_mutex};
+    if(m_shutdown || job.intent != m_intent.load(std::memory_order_acquire))
+      return false;
+    m_job = job;
+    if(!m_worker.joinable())
+    {
+      try
+      {
+        m_worker = std::thread{[this] { runWorker(); }};
+      }
+      catch(...)
+      {
+        m_job.reset();
+        return false;
+      }
+    }
+  }
+  m_worker_cv.notify_all();
+  return true;
+}
+
+void InputStream::runWorker() noexcept
+{
+  std::unique_lock l{m_worker_mutex};
+  for(;;)
+  {
+    m_worker_cv.wait(l, [this] { return m_shutdown || m_job.has_value(); });
+    if(m_shutdown)
+      return;
+    const Job job = *m_job;
+    m_job.reset();
+    l.unlock();
+    runJob(job);
+    l.lock();
+  }
+}
+
+bool InputStream::sleepFor(std::chrono::milliseconds d, uint64_t intent) noexcept
+{
+  std::unique_lock l{m_worker_mutex};
+  return !m_worker_cv.wait_for(l, d, [&] {
+    return m_shutdown || m_intent.load(std::memory_order_acquire) != intent;
+  });
+}
+
+void InputStream::runJob(const Job& job) noexcept
+{
+  const auto current = [&] {
+    return !m_closed && m_intent.load(std::memory_order_acquire) == job.intent;
+  };
+
+  if(job.restart)
+  {
+    {
+      std::lock_guard lifecycle{m_lifecycle};
+      if(!current() || !m_running.load(std::memory_order_acquire))
+        return;
+      stopLocked();
+    }
+    if(!sleepFor(std::chrono::milliseconds(500), job.intent))
+      return;
+  }
+
+  for(int attempt = job.firstAttempt; attempt < start_attempts; attempt++)
+  {
+    if(!sleepFor(startBackoff(attempt), job.intent))
+      return;
+    Attempt r{};
+    {
+      std::lock_guard lifecycle{m_lifecycle};
+      if(!current() || m_running.load(std::memory_order_acquire))
+        return;
+      r = attemptStart(attempt, attempt + 1 == start_attempts);
+    }
+    if(r == Attempt::Started)
+    {
+      notifyRestarted();
+      return;
+    }
+  }
+  qWarning() << "[depthcam] the camera did not start after" << start_attempts
+             << "attempts";
+}
+
+void InputStream::notifyRestarted() noexcept
+{
+  std::lock_guard l{m_restarted_mutex};
+  if(m_restarted_cb)
+    m_restarted_cb();
+}
+
+void InputStream::setRestartedCallback(std::function<void()> cb) noexcept
+{
+  std::lock_guard l{m_restarted_mutex};
+  m_restarted_cb = std::move(cb);
+}
+
 void InputStream::noteFirstFrame(const depthcam_frame& f) noexcept
 {
   if(depthcamTrace())
     qDebug() << "[depthcam-trace] first frame of stream" << f.stream << f.width << "x"
              << f.height << "format" << f.format;
-  int idx = -1;
-  switch(f.stream)
-  {
-    case DEPTHCAM_STREAM_COLOR:
-      idx = 0;
-      break;
-    case DEPTHCAM_STREAM_IR:
-      idx = 1;
-      break;
-    case DEPTHCAM_STREAM_DEPTH:
-      idx = 2;
-      break;
-    default:
-      return;
-  }
-  const int w = m_requestedSize[idx][0], h = m_requestedSize[idx][1];
-  if(w > 0 && h > 0 && (f.width != w || f.height != h))
-  {
-    qWarning() << "[depthcam] stream" << f.stream << "came up at" << f.width << "x"
-               << f.height << "instead of" << w << "x" << h;
-    m_degraded.store(true, std::memory_order_release);
-  }
 }
 
 void InputStream::checkHealth(const std::shared_ptr<InputStream>& self) noexcept
 {
-  if(!self || !self->running() || self->m_restarting.load(std::memory_order_acquire))
+  if(!self || !self->m_started.load(std::memory_order_acquire))
     return;
   if(self->m_restarts.load(std::memory_order_acquire) >= 3)
     return;
-  const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
-                          std::chrono::steady_clock::now().time_since_epoch())
-                          .count();
-  if(now - self->m_startedAtMs.load(std::memory_order_acquire) < 3000)
+  const int64_t now = steadyMs();
+  const int64_t started = self->m_startedAtMs.load(std::memory_order_acquire);
+  if(now - started < 3000)
     return;
 
-  bool restart = self->m_degraded.load(std::memory_order_acquire);
   const uint32_t seen = self->m_seen.load(std::memory_order_acquire);
-  if(!restart && seen != 0)
+  if(seen == 0)
+    return;
+  const uint32_t judged
+      = self->m_requested & self->m_active.load(std::memory_order_acquire) & ~seen;
+  bool missing = false;
+  for(const StreamOutput* o : {&self->m_rgb, &self->m_ir, &self->m_depth})
   {
-    for(const StreamOutput* o : {&self->m_rgb, &self->m_ir, &self->m_depth})
-      if((self->m_requested & o->stream) && !(seen & o->stream)
-         && o->consumers.load(std::memory_order_acquire) > 0)
-        restart = true;
+    if(!(judged & o->stream) || o->consumers.load(std::memory_order_acquire) <= 0)
+      continue;
+    const int64_t since
+        = std::max(started, o->demanded_since_ms.load(std::memory_order_acquire));
+    if(now - since >= 3000)
+      missing = true;
   }
-  if(!restart || self->m_restarting.exchange(true))
+  if(!missing)
     return;
 
+  // Both nodes call this every frame; one restart per stop.
+  if(!self->m_started.exchange(false, std::memory_order_acq_rel))
+    return;
+  const uint64_t intent = self->m_intent.load(std::memory_order_acquire);
+  if(!self->post({.intent = intent, .firstAttempt = 0, .restart = true}))
+    return;
   const int n = self->m_restarts.fetch_add(1) + 1;
-  qWarning() << "[depthcam] the camera is not delivering what was asked; restarting it"
+  qWarning() << "[depthcam] a consumed stream gets no frame; restarting the camera"
              << "(" << n << "/ 3 )";
-  std::thread([s = self] {
-    s->stop();
-    std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    s->start();
-    s->m_restarting.store(false, std::memory_order_release);
-  }).detach();
 }
 
 void InputStream::requestStop() noexcept

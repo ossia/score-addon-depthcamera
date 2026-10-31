@@ -1167,8 +1167,11 @@ namespace
 
 const char* backend_last_error()
 {
+  // A copy: another thread may reassign the original as soon as the lock goes.
+  thread_local std::string copy;
   std::lock_guard lock{g_error_mutex};
-  return g_last_error.empty() ? nullptr : g_last_error.c_str();
+  copy = g_last_error;
+  return copy.empty() ? nullptr : copy.c_str();
 }
 
 int backend_init(const char* resource_dir)

@@ -54,11 +54,13 @@
 #include <DepthCamera/DepthCameraSettings.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 #include <vector>
@@ -166,6 +168,9 @@ private:
     /// Last value published. Qt thread only.
     double last{};
     bool has_last{};
+
+    /// What the camera answered the last refused write. Worker only.
+    std::optional<std::string> refusal;
   };
 
   struct Request
@@ -193,6 +198,9 @@ private:
   Entry* find(const ossia::net::parameter_base& param) noexcept;
   int indexOf(const ossia::net::parameter_base& param) noexcept;
   int indexOf(std::string_view id) const noexcept;
+  /// indexOf, accepting the names saved by earlier versions; @p id is
+  /// rewritten to the current one.
+  int indexOfSaved(std::string& id) const noexcept;
 
   void buildBackendControls(ossia::net::node_base& root);
   void buildRenderControls(ossia::net::node_base& root);
@@ -245,6 +253,9 @@ private:
   std::mutex m_idle_lock;
   std::condition_variable m_idle_cv;
   int64_t m_idleAsked{0}, m_idleDone{0};
+
+  /// Worker only.
+  std::chrono::steady_clock::time_point m_lastPowerRefusal{}, m_powerRetryUntil{};
 
   /// How many pollable controls have a listener. Zero means the worker sleeps.
   std::atomic_int m_polled{0};

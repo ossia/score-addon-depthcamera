@@ -41,19 +41,23 @@ std::string strip_vendor(std::string name, std::string_view prefix)
     name.erase(0, prefix.size());
   return name;
 }
-std::string g_last_error;
-std::mutex g_error_mutex;
+/// Per thread: the host reads it right after the call that failed, and must
+/// neither see another thread's failure nor read a string being reassigned.
+thread_local std::string t_last_error;
 
 void set_error(const std::string& e)
 {
-  std::lock_guard lock{g_error_mutex};
-  g_last_error = e;
+  t_last_error = e;
+}
+
+void clear_error() noexcept
+{
+  t_last_error.clear();
 }
 
 const char* backend_last_error()
 {
-  std::lock_guard lock{g_error_mutex};
-  return g_last_error.empty() ? nullptr : g_last_error.c_str();
+  return t_last_error.empty() ? nullptr : t_last_error.c_str();
 }
 
 std::unique_ptr<rs2::context> g_context;
@@ -1330,6 +1334,7 @@ int backend_list_controls2(depthcam_device* dev, depthcam_control2_cb cb, void* 
 
 int backend_get_control(depthcam_device* dev, const char* id, double* out)
 {
+  clear_error();
   if(!dev || !out)
     return 0;
   std::lock_guard lock{dev->control_lock};
@@ -1359,6 +1364,7 @@ int backend_get_control(depthcam_device* dev, const char* id, double* out)
 
 int backend_set_control(depthcam_device* dev, const char* id, double value)
 {
+  clear_error();
   if(!dev)
     return 0;
   std::lock_guard lock{dev->control_lock};
@@ -1709,6 +1715,7 @@ void backend_set_stream_demand(depthcam_device* dev, uint32_t streams)
 
 depthcam_device* backend_open(const char* uri, const depthcam_open_config* config)
 {
+  clear_error();
   if(!g_context || !config)
     return nullptr;
 
@@ -1883,6 +1890,7 @@ void backend_close(depthcam_device* dev)
 
 int backend_start(depthcam_device* dev, depthcam_frame_cb on_frame, void* user)
 {
+  clear_error();
   if(!dev)
     return 0;
   if(dev->running.load(std::memory_order_acquire))
@@ -1946,6 +1954,7 @@ int backend_start(depthcam_device* dev, depthcam_frame_cb on_frame, void* user)
     // refused while the pipeline streams ("failed to set power state"): the
     // pipeline powers its own instance of the device. The controls are moved
     // to that instance's sensors, matched by name.
+    bool resubscribe = false;
     try
     {
       std::lock_guard cl{dev->control_lock};
@@ -1964,12 +1973,27 @@ int backend_start(depthcam_device* dev, depthcam_frame_cb on_frame, void* user)
              && std::strcmp(s.get_info(RS2_CAMERA_INFO_NAME), want) == 0)
           {
             e.sensor = s;
+            resubscribe = true;
             break;
           }
       }
+      // The notifications were subscribed on the sensors just replaced.
+      resubscribe = resubscribe && dev->subscribed;
+      if(resubscribe)
+        dev->subscribed = false;
     }
     catch(...)
     {
+    }
+    if(resubscribe)
+    {
+      try
+      {
+        dev->subscribeOptions();
+      }
+      catch(...)
+      {
+      }
     }
 
     // get_depth_scale() is metres per unit; the ABI wants millimetres per unit.

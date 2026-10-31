@@ -237,6 +237,180 @@ TEST_CASE("An unconsumed stream is neither queued nor produced", "[depthcam][str
   r.stream->addConsumer(r.stream->m_pcl, -1);
 }
 
+namespace
+{
+/// The synthetic camera, refusing to start or falling back on request, and
+/// able to withhold streams however much they are demanded.
+struct Flaky
+{
+  std::atomic<int> refuse{0};
+  std::atomic<int> fallback{0};
+  std::atomic<int> calls{0};
+  std::atomic<uint32_t> withhold{0};
+};
+Flaky& flaky()
+{
+  static Flaky f;
+  return f;
+}
+std::string& flakyError()
+{
+  thread_local std::string e;
+  return e;
+}
+const depthcam_backend_v1* flakyBackend()
+{
+  static const depthcam_backend_v1 t = [] {
+    auto t = *syn::backend();
+    t.start = [](depthcam_device* d, depthcam_frame_cb cb, void* u) -> int {
+      auto& f = flaky();
+      f.calls++;
+      flakyError().clear();
+      if(f.refuse > 0)
+      {
+        f.refuse--;
+        flakyError() = "failed to set power state";
+        return 0;
+      }
+      if(!syn::backend()->start(d, cb, u))
+        return 0;
+      if(f.fallback > 0)
+      {
+        f.fallback--;
+        flakyError() = "requested stream configuration unavailable; falling back to "
+                       "the camera's own defaults";
+      }
+      return 1;
+    };
+    t.last_error = []() -> const char* {
+      return flakyError().empty() ? nullptr : flakyError().c_str();
+    };
+    t.set_stream_demand = [](depthcam_device* d, uint32_t s) {
+      syn::backend()->set_stream_demand(d, s & ~flaky().withhold.load());
+    };
+    return t;
+  }();
+  return &t;
+}
+
+std::shared_ptr<InputStream> flakyStream(DepthCameraSettings s)
+{
+  s.device = "synthetic:clock=manual";
+  auto st = std::make_shared<InputStream>(flakyBackend(), s.device, s);
+  st->addConsumer(st->m_depth, 1);
+  return st;
+}
+
+template <typename F>
+bool waitFor(F f, std::chrono::milliseconds timeout)
+{
+  const auto end = std::chrono::steady_clock::now() + timeout;
+  while(!f())
+  {
+    if(std::chrono::steady_clock::now() > end)
+      return false;
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+  }
+  return true;
+}
+}
+
+TEST_CASE("A camera refusing to start is retried off the calling thread", "[depthcam][stream]")
+{
+  auto st = flakyStream(settingsFor({}));
+  flaky().calls = 0;
+  flaky().refuse = 2;
+  const auto t0 = std::chrono::steady_clock::now();
+  CHECK_FALSE(st->start());
+  CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(200));
+  CHECK(waitFor([&] { return st->running(); }, std::chrono::seconds(3)));
+  CHECK(flaky().calls == 3);
+  st->close();
+}
+
+TEST_CASE("Stopping cancels the retries", "[depthcam][stream]")
+{
+  auto st = flakyStream(settingsFor({}));
+  flaky().calls = 0;
+  flaky().refuse = 100;
+  CHECK_FALSE(st->start());
+  st->stop();
+  std::this_thread::sleep_for(std::chrono::milliseconds(600));
+  CHECK(flaky().calls == 1);
+  CHECK_FALSE(st->running());
+
+  // And closing does not wait for them.
+  CHECK_FALSE(st->start());
+  const auto t0 = std::chrono::steady_clock::now();
+  st->close();
+  CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(200));
+  CHECK(flaky().calls == 2);
+  CHECK_FALSE(st->start());
+  flaky().refuse = 0;
+}
+
+TEST_CASE("A camera falling back twice is not accepted", "[depthcam][stream]")
+{
+  auto st = flakyStream(settingsFor({}));
+  flaky().calls = 0;
+  flaky().fallback = 2;
+  CHECK_FALSE(st->start());
+  CHECK(waitFor([&] { return st->running(); }, std::chrono::seconds(3)));
+  CHECK(flaky().calls == 3);
+  st->close();
+}
+
+TEST_CASE("A stream that never comes restarts the camera, once demanded long enough", "[depthcam][stream]")
+{
+  auto s = settingsFor({});
+  s.ir = true;
+  auto st = flakyStream(s);
+  flaky().withhold = DEPTHCAM_STREAM_IR;
+  auto& c = syn::counters();
+  REQUIRE(st->start());
+  const auto starts0 = c.starts.load();
+
+  const auto runFor = [&](std::chrono::milliseconds d, bool check = true) {
+    const auto end = std::chrono::steady_clock::now() + d;
+    while(std::chrono::steady_clock::now() < end)
+    {
+      syn::step(st->device(), 1);
+      st->m_depth.queue.drain();
+      if(check)
+        InputStream::checkHealth(st);
+      std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    }
+  };
+
+  // Nobody draws the infrared: nothing is missing.
+  runFor(std::chrono::milliseconds(3200));
+  CHECK(c.starts.load() == starts0);
+
+  // Drawn from now on: it gets the same 3 s as at start.
+  st->addConsumer(st->m_ir, 1);
+  runFor(std::chrono::milliseconds(1500));
+  CHECK(c.starts.load() == starts0);
+  CHECK(st->running());
+
+  runFor(std::chrono::milliseconds(1700));
+  CHECK(waitFor([&] { return c.starts.load() == starts0 + 1 && st->running(); },
+                std::chrono::seconds(2)));
+
+  // A stop while a restart is under way is the user's, and stays.
+  runFor(std::chrono::milliseconds(3200), false);
+  const auto starts1 = c.starts.load();
+  CHECK(starts1 == starts0 + 1);
+  InputStream::checkHealth(st);
+  st->stop();
+  std::this_thread::sleep_for(std::chrono::milliseconds(900));
+  CHECK_FALSE(st->running());
+  CHECK(c.starts.load() == starts1);
+
+  st->addConsumer(st->m_ir, -1);
+  flaky().withhold = 0;
+  st->close();
+}
+
 // --- calibration -----------------------------------------------------------------
 
 TEST_CASE("Calibration is read from the camera", "[depthcam][calibration]")
@@ -737,6 +911,34 @@ TEST_CASE("Store and reset", "[depthcam][controls]")
 }
 
 // --- ABI versions ---------------------------------------------------------------------
+
+TEST_CASE("Settings saved under the old RealSense names still apply", "[depthcam][controls]")
+{
+  ControlRig r{ControlTree::ControlValues{
+      {QStringLiteral("color/enable_auto_exposure"), {0.}},
+      {QStringLiteral("color/exposure"), {1500.}}}};
+  REQUIRE(r.tree->replayed().wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+  r.settle();
+  CHECK(r.cam("color/auto_exposure") == 0.);
+  CHECK(r.cam("color/exposure") == 1500.);
+  const auto stored = r.tree->stored();
+  REQUIRE(stored.size() == 2);
+  CHECK(stored[0].id == "color/auto_exposure");
+}
+
+TEST_CASE("An enum given a number as text takes only a value it has", "[depthcam][controls]")
+{
+  ControlRig r;
+  r.write("device/preset", std::string{"2"});
+  CHECK(r.cam("device/preset") == 2.);
+  for(auto bad : {"nan", "inf", "1.5", "0x1", " 1", "3", "-1", ""})
+  {
+    CAPTURE(bad);
+    CHECK_FALSE(r.tree->write(r.p("device/preset"), std::string{bad}));
+  }
+  r.settle();
+  CHECK(r.cam("device/preset") == 2.);
+}
 
 TEST_CASE("An ABI 3 table is copied without reading past its end", "[depthcam][abi]")
 {
