@@ -560,9 +560,11 @@ if(SCORE_DEPTHCAM_BUILD_REALSENSE
   set(BUILD_NETWORK_DEVICE OFF CACHE INTERNAL "")
   set(IMPORT_DEPTH_CAM_FW OFF CACHE INTERNAL "")
   set(CHECK_FOR_UPDATES OFF CACHE INTERNAL "")
-  # The libusb backend rather than V4L2: V4L2 needs patched kernel modules for
-  # full functionality, and the udev rules we ship grant raw USB access anyway.
-  set(FORCE_RSUSB_BACKEND ON CACHE INTERNAL "")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(FORCE_RSUSB_BACKEND ON CACHE INTERNAL "")
+  else()
+    set(FORCE_RSUSB_BACKEND OFF CACHE INTERNAL "")
+  endif()
 
   # librealsense's install_config.cmake runs configure_package_config_file,
   # which rejects a relative CMAKE_INSTALL_PREFIX outright ("INSTALL_PREFIX
