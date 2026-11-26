@@ -169,7 +169,7 @@ private:
   void handlePointCloud(const depthcam_frame& f);
   void handleImu(const depthcam_frame& f);
 
-  AVFrame* decodeCompressed(const depthcam_frame& f);
+  ::Video::AVFramePointer decodeCompressed(StreamOutput& out, const depthcam_frame& f);
   AVCodecContext* codecContext(AVCodecID id);
   void releaseCodecs();
 

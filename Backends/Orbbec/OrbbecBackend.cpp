@@ -69,10 +69,9 @@ depthcam_format to_depthcam_format(OBFormat fmt)
     case OB_FORMAT_NV12:
       return DEPTHCAM_FMT_NV12;
     case OB_FORMAT_I420:
-    // YV12 is planar YUV 4:2:0 with the chroma planes swapped, not a grey
-    // format; the plane order is a layout detail the host handles.
-    case OB_FORMAT_YV12:
       return DEPTHCAM_FMT_YUV420P;
+    case OB_FORMAT_YV12:
+      return DEPTHCAM_FMT_YV12;
 
     case OB_FORMAT_RGB:
       return DEPTHCAM_FMT_RGB24;
