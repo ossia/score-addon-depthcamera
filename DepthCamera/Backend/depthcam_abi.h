@@ -121,6 +121,9 @@ enum depthcam_format
 
   /* One depthcam_imu_sample. */
   DEPTHCAM_FMT_IMU,
+
+  /* Planar 4:2:0 like DEPTHCAM_FMT_YUV420P, V plane before U. */
+  DEPTHCAM_FMT_YV12,
 };
 
 /** Which fields of a depthcam_imu_sample carry a reading. */

@@ -958,4 +958,12 @@ int64_t nextFrame(depthcam_device* d)
   return d ? d->frame.load() : 0;
 }
 
+void inject(depthcam_device* d, const depthcam_frame& f)
+{
+  if(d && d->cb)
+    d->cb(&f, d->user);
+  else if(f.release)
+    f.release(f.owner);
+}
+
 }

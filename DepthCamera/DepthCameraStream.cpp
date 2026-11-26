@@ -4,7 +4,10 @@
 
 #include <DepthCamera/DepthCameraSettings.hpp>
 
-#include <Video/GStreamerCompatibility.hpp>
+
+extern "C" {
+#include <libavutil/imgutils.h>
+}
 
 #include <QDebug>
 
@@ -49,6 +52,7 @@ AVPixelFormat to_av_format(int fmt)
     case DEPTHCAM_FMT_NV12:
       return AV_PIX_FMT_NV12;
     case DEPTHCAM_FMT_YUV420P:
+    case DEPTHCAM_FMT_YV12:
       return AV_PIX_FMT_YUV420P;
     default:
       // Compressed and point-cloud formats are handled separately.
@@ -100,6 +104,42 @@ bool wrap_borrowed(AVFrame& frame, const depthcam_frame& f)
     return false;
   }
   frame.data[0] = frame.buf[0]->data;
+  return true;
+}
+
+/// Lays the planes of a borrowed buffer out from the backend's row stride.
+/// Chroma rows are assumed to scale with the luma row, as in I420 and NV12.
+bool layout_planes(AVFrame& frame, const depthcam_frame& f)
+{
+  const auto fmt = AVPixelFormat(frame.format);
+  int lines[4]{};
+  if(av_image_fill_linesizes(lines, fmt, f.width) < 0 || lines[0] <= 0)
+    return false;
+  if(f.stride > 0 && f.stride != lines[0])
+  {
+    if(f.stride < lines[0])
+      return false;
+    for(int i = 1; i < 4; i++)
+      lines[i] = int(int64_t(lines[i]) * f.stride / lines[0]);
+    lines[0] = f.stride;
+  }
+
+  ptrdiff_t lines64[4];
+  for(int i = 0; i < 4; i++)
+    lines64[i] = lines[i];
+  size_t sizes[4]{};
+  if(av_image_fill_plane_sizes(sizes, fmt, f.height, lines64) < 0)
+    return false;
+  if(sizes[0] + sizes[1] + sizes[2] + sizes[3] > f.bytes)
+    return false;
+
+  if(av_image_fill_pointers(frame.data, fmt, f.height, frame.data[0], lines) < 0)
+    return false;
+  for(int i = 0; i < 4; i++)
+    frame.linesize[i] = lines[i];
+
+  if(f.format == DEPTHCAM_FMT_YV12)
+    std::swap(frame.data[1], frame.data[2]);
   return true;
 }
 }
@@ -413,7 +453,7 @@ void InputStream::handleImage(StreamOutput& out, const depthcam_frame& f)
 
   if(const auto codec = to_codec_id(f.format); codec != AV_CODEC_ID_NONE)
   {
-    AVFrame* decoded = decodeCompressed(f);
+    ::Video::AVFramePointer decoded = decodeCompressed(out, f);
     if(f.release)
       f.release(f.owner); // the decoder copied what it needed
     if(decoded)
@@ -421,8 +461,8 @@ void InputStream::handleImage(StreamOutput& out, const depthcam_frame& f)
       out.width.store(decoded->width, std::memory_order_relaxed);
       out.height.store(decoded->height, std::memory_order_relaxed);
       out.format.store(decoded->format, std::memory_order_relaxed);
-      stamp(out, f, decoded);
-      out.queue.enqueue(decoded);
+      stamp(out, f, decoded.get());
+      out.queue.enqueue(decoded.release());
     }
     return;
   }
@@ -447,14 +487,10 @@ void InputStream::handleImage(StreamOutput& out, const depthcam_frame& f)
     return;
   }
 
-  // Fill in the remaining planes/strides for the borrowed buffer. The frame
-  // already owns its reference, so a failure here still releases correctly when
-  // the AVFramePointer goes out of scope.
-  if(!::Video::initFrameFromRawData(frame.get(), frame->data[0], f.bytes))
+  // The frame already owns its reference, so a failure here still releases
+  // correctly when the AVFramePointer goes out of scope.
+  if(!layout_planes(*frame, f))
     return;
-
-  if(f.stride > 0)
-    frame->linesize[0] = f.stride;
 
   out.width.store(f.width, std::memory_order_relaxed);
   out.height.store(f.height, std::memory_order_relaxed);
@@ -561,7 +597,8 @@ void InputStream::releaseCodecs()
     av_packet_free(&m_packet);
 }
 
-AVFrame* InputStream::decodeCompressed(const depthcam_frame& f)
+::Video::AVFramePointer
+InputStream::decodeCompressed(StreamOutput& out, const depthcam_frame& f)
 {
   AVCodecContext* ctx = codecContext(to_codec_id(f.format));
   if(!ctx)
@@ -582,14 +619,11 @@ AVFrame* InputStream::decodeCompressed(const depthcam_frame& f)
   if(avcodec_send_packet(ctx, m_packet) < 0)
     return nullptr;
 
-  AVFrame* frame = av_frame_alloc();
+  ::Video::AVFramePointer frame = out.queue.newFrame();
   if(!frame)
     return nullptr;
-  if(avcodec_receive_frame(ctx, frame) < 0)
-  {
-    av_frame_free(&frame);
+  if(avcodec_receive_frame(ctx, frame.get()) < 0)
     return nullptr;
-  }
   return frame;
 }
 

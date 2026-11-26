@@ -29,12 +29,15 @@
 #include <catch2/catch_test_macros.hpp>
 
 extern "C" {
+#include <libavcodec/avcodec.h>
 #include <libavutil/frame.h>
 }
 
 #include <chrono>
 #include <cmath>
+#include <set>
 #include <thread>
+#include <vector>
 
 using namespace Gfx::DepthCamera;
 namespace syn = depthcam_synthetic;
@@ -235,6 +238,150 @@ TEST_CASE("An unconsumed stream is neither queued nor produced", "[depthcam][str
   CHECK(c.pointclouds_computed.load() == clouds0 + 2);
   CHECK(r.stream->m_pcl.queue.size() == 2);
   r.stream->addConsumer(r.stream->m_pcl, -1);
+}
+
+namespace
+{
+struct Injected
+{
+  std::vector<uint8_t> bytes;
+  static void release(void* p) { delete static_cast<Injected*>(p); }
+};
+
+void injectColor(Rig& r, int fmt, int w, int h, int stride, std::vector<uint8_t> bytes)
+{
+  auto* owner = new Injected{std::move(bytes)};
+  depthcam_frame f{};
+  f.stream = DEPTHCAM_STREAM_COLOR;
+  f.format = fmt;
+  f.width = w;
+  f.height = h;
+  f.stride = stride;
+  f.data = owner->bytes.data();
+  f.bytes = owner->bytes.size();
+  f.owner = owner;
+  f.release = &Injected::release;
+  syn::inject(r.stream->device(), f);
+}
+
+std::vector<uint8_t> encodeJpeg(int w, int h)
+{
+  std::vector<uint8_t> out;
+  const AVCodec* codec = avcodec_find_encoder(AV_CODEC_ID_MJPEG);
+  if(!codec)
+    return out;
+  AVCodecContext* ctx = avcodec_alloc_context3(codec);
+  ctx->width = w;
+  ctx->height = h;
+  ctx->pix_fmt = AV_PIX_FMT_YUVJ420P;
+  ctx->time_base = AVRational{1, 30};
+  if(avcodec_open2(ctx, codec, nullptr) < 0)
+  {
+    avcodec_free_context(&ctx);
+    return out;
+  }
+  AVFrame* frame = av_frame_alloc();
+  frame->format = ctx->pix_fmt;
+  frame->width = w;
+  frame->height = h;
+  av_frame_get_buffer(frame, 0);
+  for(int p = 0; p < 3; p++)
+    for(int y = 0; y < (p ? h / 2 : h); y++)
+      std::memset(frame->data[p] + y * frame->linesize[p], p ? 128 : 0x40, p ? w / 2 : w);
+  AVPacket* pkt = av_packet_alloc();
+  if(avcodec_send_frame(ctx, frame) >= 0 && avcodec_receive_packet(ctx, pkt) >= 0)
+    out.assign(pkt->data, pkt->data + pkt->size);
+  av_packet_free(&pkt);
+  av_frame_free(&frame);
+  avcodec_free_context(&ctx);
+  return out;
+}
+
+DepthCameraSettings colorSettings()
+{
+  auto s = settingsFor("synthetic:clock=manual");
+  s.rgb = true;
+  s.depth = false;
+  return s;
+}
+
+struct ColorRig : Rig
+{
+  ColorRig()
+      : Rig{"synthetic:clock=manual", colorSettings(), false}
+  {
+    stream->addConsumer(stream->m_rgb, 1);
+  }
+};
+}
+
+TEST_CASE("Decoded MJPEG frames are recycled", "[depthcam][stream]")
+{
+  const auto jpeg = encodeJpeg(64, 48);
+  REQUIRE(!jpeg.empty());
+  ColorRig r;
+  REQUIRE(r.stream->start());
+
+  std::set<AVFrame*> seen;
+  for(int i = 0; i < 10; i++)
+  {
+    injectColor(r, DEPTHCAM_FMT_MJPEG, 64, 48, 0, jpeg);
+    AVFrame* f = r.stream->m_rgb.queue.dequeue();
+    REQUIRE(f);
+    CHECK(f->width == 64);
+    CHECK(f->color_range == AVCOL_RANGE_JPEG);
+    seen.insert(f);
+    r.stream->m_rgb.queue.release(f);
+  }
+  CHECK(seen.size() <= 2);
+  r.stream->addConsumer(r.stream->m_rgb, -1);
+}
+
+TEST_CASE("YV12 frames have their chroma planes in U, V order", "[depthcam][stream]")
+{
+  ColorRig r;
+  REQUIRE(r.stream->start());
+
+  std::vector<uint8_t> yv12(4 * 4 + 2 * 2 * 2);
+  std::memset(yv12.data(), 16, 16);
+  std::memset(yv12.data() + 16, 200, 4); // V
+  std::memset(yv12.data() + 20, 50, 4);  // U
+  injectColor(r, DEPTHCAM_FMT_YV12, 4, 4, 0, yv12);
+
+  AVFrame* f = r.stream->m_rgb.queue.dequeue();
+  REQUIRE(f);
+  CHECK(f->format == AV_PIX_FMT_YUV420P);
+  CHECK(f->data[1][0] == 50);
+  CHECK(f->data[2][0] == 200);
+  r.stream->m_rgb.queue.release(f);
+  r.stream->addConsumer(r.stream->m_rgb, -1);
+}
+
+TEST_CASE("Planar frames with a padded stride lay out every plane", "[depthcam][stream]")
+{
+  ColorRig r;
+  REQUIRE(r.stream->start());
+
+  // 4x4 I420 with 8-byte luma rows: Y 8x4, U 4x2, V 4x2.
+  std::vector<uint8_t> i420(32 + 8 + 8);
+  std::memset(i420.data(), 16, 32);
+  std::memset(i420.data() + 32, 50, 8);
+  std::memset(i420.data() + 40, 200, 8);
+  injectColor(r, DEPTHCAM_FMT_YUV420P, 4, 4, 8, i420);
+
+  AVFrame* f = r.stream->m_rgb.queue.dequeue();
+  REQUIRE(f);
+  CHECK(f->linesize[0] == 8);
+  CHECK(f->linesize[1] == 4);
+  CHECK(f->linesize[2] == 4);
+  CHECK(f->data[1] - f->data[0] == 32);
+  CHECK(f->data[2] - f->data[0] == 40);
+  r.stream->m_rgb.queue.release(f);
+
+  // A stride the buffer cannot hold is refused rather than read past.
+  injectColor(r, DEPTHCAM_FMT_YUV420P, 4, 4, 16, i420);
+  CHECK(r.stream->m_rgb.queue.dequeue() == nullptr);
+  r.stream->addConsumer(r.stream->m_rgb, -1);
 }
 
 // --- calibration -----------------------------------------------------------------

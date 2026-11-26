@@ -68,4 +68,8 @@ void step(depthcam_device* dev, int n = 1);
 /// The frame number of the next frame.
 int64_t nextFrame(depthcam_device* dev);
 
+/// Hands @p f to the host's frame callback from the calling thread, for
+/// layouts the scene does not produce. The host releases it as usual.
+void inject(depthcam_device* dev, const depthcam_frame& f);
+
 }

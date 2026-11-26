@@ -559,6 +559,7 @@ const char* formatName(int fmt)
       return "YUV 4:2:2";
     case DEPTHCAM_FMT_NV12:
     case DEPTHCAM_FMT_YUV420P:
+    case DEPTHCAM_FMT_YV12:
       return "YUV 4:2:0";
     case DEPTHCAM_FMT_MJPEG:
       return "MJPEG";
